@@ -9,7 +9,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include "convey4.h"
+#include "convey_main4.c"
 
 int main(void)
 {
