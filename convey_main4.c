@@ -1,1473 +1,1651 @@
-/*
-	* convey_main.c  –  Implementation of the convey dynamic-string library.
-	*
-	* Build:
-	*   Compile together with utf8proc.c, or link against -lutf8proc.
-	*   Requires C11 or later (uses _Static_assert, designated initialisers, etc.).
-	*   Compile with -std=c11 -Wall -Wextra.
-	*/
-
-#include <limits.h> /* UINT32_MAX */
-#include <stdint.h>
+#include <limits.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include "convey4.h"
+#include "bent.h"
 
-/*
-	* SSIZE_MAX: the largest positive value that fits in a ssize_t / ptrdiff_t.
-	* Used to clamp size_t byte counts before passing them to utf8proc functions
-	* whose length parameters are signed.  Defined here as a fallback for platforms
-	* (MSVC, some embedded headers) that do not expose it via <limits.h>.
-	*/
 #ifndef SSIZE_MAX
-#define SSIZE_MAX ((size_t)(~(size_t)0) >> 1)
+#  define SSIZE_MAX ((size_t)(~(size_t)0) >> 1)
 #endif
 
-/*─────────────────────────────────────────────────────────────────────────────────
-	INTERNAL HELPERS
-	All helpers in this section are declared `static inline` to give them internal
-	linkage and allow the compiler to inline them freely.  Without `static` they
-	would have external linkage, pollute the global symbol table, and collide with
-	identical names in other translation units (e.g. the system's own `bswap16`).
-─────────────────────────────────────────────────────────────────────────────────*/
+/* ── Compile-time alignment flag (embedded in every flags byte) ─────────── */
+#ifdef b_ALIGNED
+#  define B_STR_ALIGN_FLAG B_STRING_ALIGNED
+#else
+#  define B_STR_ALIGN_FLAG B_STRING_PACKED
+#endif
+
+/* ── BOM byte sequences ─────────────────────────────────────────────────── */
+static const uint8_t BOM_UTF8[3]    = {0xEFu, 0xBBu, 0xBFu};
+static const uint8_t BOM_UTF16LE[2] = {0xFFu, 0xFEu};
+static const uint8_t BOM_UTF16BE[2] = {0xFEu, 0xFFu};
+static const uint8_t BOM_UTF32LE[4] = {0xFFu, 0xFEu, 0x00u, 0x00u};
+static const uint8_t BOM_UTF32BE[4] = {0x00u, 0x00u, 0xFEu, 0xFFu};
+
+/*──────────────────────────────────────────────────────────────────────────────
+  INTERNAL HELPERS
+──────────────────────────────────────────────────────────────────────────────*/
 
 /*
-	* null_size_for  –  Return the NUL-terminator byte count for a given encoding.
-	* Mirrors C_STRING_NULL_SIZE() but as an inline function for clarity in places
-	* where the macro expansion would be verbose.
-	*/
-static inline size_t null_size_for(unsigned char enc) {
-	return ((enc & C_STRING_ENC_MASK) == C_STRING_ENC_UTF16) ? 2u : 1u;
-}
-
-/*
-	* c_read_u16  –  Read a uint16_t from an unaligned address without UB.
-	* Using memcpy lets the compiler emit the optimal load (e.g. `movzwl` on x86)
-	* without strict-aliasing or alignment violations.
-	*/
-static inline uint16_t c_read_u16(const void* ptr) {
-	uint16_t v;
-	memcpy(&v, ptr, sizeof v);
-	return v;
-}
-
-/*
-	* c_write_u16  –  Write a uint16_t to an unaligned address without UB.
-	*/
-static inline void c_write_u16(void* ptr, uint16_t v) {
-	memcpy(ptr, &v, sizeof v);
+ * _null_term_size – return the null-terminator width in bytes for an encoding.
+ *   UTF-32 encodings require 4 zero bytes.
+ *   UTF-16 encodings require 2 zero bytes.
+ *   ASCII and UTF-8 require 1 zero byte.
+ */
+static inline size_t _null_term_size(uint8_t encoding) {
+    if (B_STR_IS_UTF32_ENC(encoding)) return 4u;
+    if (B_STR_IS_UTF16_ENC(encoding)) return 2u;
+    return 1u;
 }
 
 /*
-	* bswap16  –  Swap the two bytes of a 16-bit value.
-	* Declared static inline to avoid conflicts with <byteswap.h> on Linux,
-	* compiler built-ins, or any other translation unit that defines the same name.
-	*/
-static inline uint16_t bswap16(uint16_t v) {
-	return (uint16_t)(((v & 0x00FFu) << 8) | ((v & 0xFF00u) >> 8));
+ * _align_len_down – round a byte length DOWN to the encoding's code-unit
+ * boundary.  Used to strip any stray trailing byte that would split a unit.
+ */
+static inline size_t _align_len_down(size_t byte_length, uint8_t encoding) {
+    if (B_STR_IS_UTF32_ENC(encoding)) return byte_length & ~(size_t)3u;
+    if (B_STR_IS_UTF16_ENC(encoding)) return byte_length & ~(size_t)1u;
+    return byte_length;
 }
 
 /*
-	* host_is_le  –  Return true when the host CPU is little-endian.
-	* The probe variable's address aliased via char * is a defined exception to
-	* strict aliasing (C11 §6.5 p7).
-	*/
-static inline bool host_is_le(void) {
-	const int probe = 1;
-	return *(const char*)&probe == 1;
+ * _align_cap_up – round a capacity UP to the next code-unit boundary.
+ * Used when sizing new allocations so no capacity byte is wasted inside a unit.
+ * NOTE: callers must ensure (capacity + 3) does not overflow size_t; the
+ * overflow clamp in b_str_ensure guarantees this for all internal callers.
+ */
+static inline size_t _align_cap_up(size_t capacity, uint8_t encoding) {
+    if (B_STR_IS_UTF32_ENC(encoding)) return (capacity + 3u) & ~(size_t)3u;
+    if (B_STR_IS_UTF16_ENC(encoding)) return (capacity + 1u) & ~(size_t)1u;
+    return capacity;
+}
+
+/* Write null_term_size zero bytes starting at buffer[position]. */
+static inline void _write_null_terminator(uint8_t *buffer, size_t position,
+                                          size_t null_term_size) {
+    for (size_t index = 0; index < null_term_size; index++)
+        buffer[position + index] = '\0';
+}
+
+/* Unaligned 16-bit read via memcpy (avoids strict-aliasing UB). */
+static inline uint16_t _read_u16(const void *raw_ptr) {
+    uint16_t value;
+    memcpy(&value, raw_ptr, 2);
+    return value;
+}
+
+/* Unaligned 32-bit read via memcpy. */
+static inline uint32_t _read_u32(const void *raw_ptr) {
+    uint32_t value;
+    memcpy(&value, raw_ptr, 4);
+    return value;
+}
+
+static inline uint16_t _byte_swap_16(uint16_t value) {
+    return (uint16_t)(((value & 0x00FFu) << 8) | ((value & 0xFF00u) >> 8));
+}
+
+static inline uint32_t _byte_swap_32(uint32_t value) {
+    return ((value & 0x000000FFu) << 24) | ((value & 0x0000FF00u) <<  8) |
+           ((value & 0x00FF0000u) >>  8) | ((value & 0xFF000000u) >> 24);
+}
+
+/* System-native UTF-16 encoding tag (compile-time constant when SDL present). */
+static inline uint8_t _system_utf16_encoding(void) {
+#if defined(SDL_BYTEORDER) && SDL_BYTEORDER == SDL_BIG_ENDIAN
+    return B_STR_ENC_UTF16BE;
+#else
+    return B_STR_ENC_UTF16LE;
+#endif
+}
+
+/* System-native UTF-32 encoding tag. */
+static inline uint8_t _system_utf32_encoding(void) {
+#if defined(SDL_BYTEORDER) && SDL_BYTEORDER == SDL_BIG_ENDIAN
+    return B_STR_ENC_UTF32BE;
+#else
+    return B_STR_ENC_UTF32LE;
+#endif
+}
+
+/*──────────────────────────────────────────────────────────────────────────────
+  CORE ACCESSORS
+──────────────────────────────────────────────────────────────────────────────*/
+
+size_t b_str_hdr_size(uint8_t flags) {
+    switch (flags & B_STR_TYPE_MASK) {
+    case B_STR_TYPE_8:  return sizeof(b_hdr8_t);
+    case B_STR_TYPE_16: return sizeof(b_hdr16_t);
+    case B_STR_TYPE_32: return sizeof(b_hdr32_t);
+    case B_STR_TYPE_64: return sizeof(b_hdr64_t);
+    default:            return 0;
+    }
+}
+
+uint8_t b_str_pick_type(size_t byte_size) {
+    if (byte_size < 256u)                return B_STR_TYPE_8;
+    if (byte_size < 65536u)              return B_STR_TYPE_16;
+    if (byte_size <= (size_t)UINT32_MAX) return B_STR_TYPE_32;
+    return B_STR_TYPE_64;
+}
+
+uint8_t b_str_enc(b_cstr_t s) {
+    return s ? (uint8_t)(s[-1] & B_STR_ENC_MASK) : B_STR_ENC_ASCII;
+}
+
+void b_str_set_enc(b_str_t s, uint8_t encoding) {
+    if (s) s[-1] = (uint8_t)((s[-1] & ~B_STR_ENC_MASK) | (encoding & B_STR_ENC_MASK));
+}
+
+size_t b_str_len(b_cstr_t s) {
+    if (!s) return 0;
+    switch (s[-1] & B_STR_TYPE_MASK) {
+    case B_STR_TYPE_8:  return B_CHDR8(s)->length;
+    case B_STR_TYPE_16: return B_CHDR16(s)->length;
+    case B_STR_TYPE_32: return B_CHDR32(s)->length;
+    case B_STR_TYPE_64: return B_CHDR64(s)->length;
+    default:            return 0;
+    }
+}
+
+size_t b_str_avail(b_cstr_t s) {
+    if (!s) return 0;
+    switch (s[-1] & B_STR_TYPE_MASK) {
+    case B_STR_TYPE_8:  { const b_hdr8_t  *h = B_CHDR8(s);  return h->capacity > h->length ? (size_t)(h->capacity - h->length) : 0; }
+    case B_STR_TYPE_16: { const b_hdr16_t *h = B_CHDR16(s); return h->capacity > h->length ? (size_t)(h->capacity - h->length) : 0; }
+    case B_STR_TYPE_32: { const b_hdr32_t *h = B_CHDR32(s); return h->capacity > h->length ? (size_t)(h->capacity - h->length) : 0; }
+    case B_STR_TYPE_64: { const b_hdr64_t *h = B_CHDR64(s); return h->capacity > h->length ? (size_t)(h->capacity - h->length) : 0; }
+    default:            return 0;
+    }
+}
+
+size_t b_str_cap(b_cstr_t s) { return s ? b_str_len(s) + b_str_avail(s) : 0; }
+
+void b_str_set_lens(b_str_t s, size_t used_bytes, size_t capacity_bytes) {
+    if (!s) return;
+    const uint8_t encoding = s[-1] & B_STR_ENC_MASK;
+    /* Round both values down to the encoding's code-unit boundary.
+     * All callers that come through b_str_ensure already pass unit-aligned
+     * values; this is a safety net for direct callers.                    */
+    used_bytes     = _align_len_down(used_bytes,     encoding);
+    capacity_bytes = _align_len_down(capacity_bytes, encoding);
+    switch (s[-1] & B_STR_TYPE_MASK) {
+    case B_STR_TYPE_8:  B_HDR8(s)->capacity  = (uint8_t) capacity_bytes;  B_HDR8(s)->length  = (uint8_t) used_bytes; break;
+    case B_STR_TYPE_16: B_HDR16(s)->capacity = (uint16_t)capacity_bytes;  B_HDR16(s)->length = (uint16_t)used_bytes; break;
+    case B_STR_TYPE_32: B_HDR32(s)->capacity = (uint32_t)capacity_bytes;  B_HDR32(s)->length = (uint32_t)used_bytes; break;
+    case B_STR_TYPE_64: B_HDR64(s)->capacity = (uint64_t)capacity_bytes;  B_HDR64(s)->length = (uint64_t)used_bytes; break;
+    }
+}
+
+void b_str_set_len(b_str_t s, size_t used_bytes) {
+    if (!s) return;
+    used_bytes = _align_len_down(used_bytes, s[-1] & B_STR_ENC_MASK);
+    switch (s[-1] & B_STR_TYPE_MASK) {
+    case B_STR_TYPE_8:  B_HDR8(s)->length  = (uint8_t) used_bytes; break;
+    case B_STR_TYPE_16: B_HDR16(s)->length = (uint16_t)used_bytes; break;
+    case B_STR_TYPE_32: B_HDR32(s)->length = (uint32_t)used_bytes; break;
+    case B_STR_TYPE_64: B_HDR64(s)->length = (uint64_t)used_bytes; break;
+    }
+}
+
+size_t b_str_cpcount(b_cstr_t s) {
+    if (!s) return 0;
+    const size_t  total_bytes = b_str_len(s);
+    const uint8_t encoding    = b_str_enc(s);
+    if (!total_bytes) return 0;
+
+    if (encoding == B_STR_ENC_UTF8) {
+        size_t codepoint_count = 0;
+        size_t byte_pos        = 0;
+        while (byte_pos < total_bytes) {
+            utf8proc_int32_t codepoint;
+            const size_t remaining = total_bytes - byte_pos;
+            const utf8proc_ssize_t advance = utf8proc_iterate(
+                s + byte_pos,
+                (utf8proc_ssize_t)(remaining < (size_t)SSIZE_MAX
+                                   ? remaining : (size_t)SSIZE_MAX),
+                &codepoint);
+            /* On invalid sequence, advance == 0 or negative; skip 1 byte. */
+            byte_pos += (advance > 0) ? (size_t)advance : 1u;
+            codepoint_count++;
+        }
+        return codepoint_count;
+    }
+
+    if (B_STR_IS_UTF16_ENC(encoding)) {
+        const bool   is_big_endian = (encoding == B_STR_ENC_UTF16BE);
+        const size_t unit_count    = total_bytes / 2u;
+        size_t codepoint_count     = 0;
+        size_t unit_index          = 0;
+        while (unit_index < unit_count) {
+            uint16_t first_unit = _read_u16(s + unit_index * 2u);
+            if (is_big_endian) first_unit = _byte_swap_16(first_unit);
+            unit_index++;
+            /* Check for a surrogate pair (high surrogate 0xD800–0xDBFF). */
+            if (first_unit >= 0xD800u && first_unit <= 0xDBFFu
+                    && unit_index < unit_count) {
+                uint16_t second_unit = _read_u16(s + unit_index * 2u);
+                if (is_big_endian) second_unit = _byte_swap_16(second_unit);
+                /* Low surrogate 0xDC00–0xDFFF: consume the pair as one CP. */
+                if (second_unit >= 0xDC00u && second_unit <= 0xDFFFu)
+                    unit_index++;
+            }
+            codepoint_count++;
+        }
+        return codepoint_count;
+    }
+
+    if (B_STR_IS_UTF32_ENC(encoding)) {
+        /* Each code unit (4 bytes) is exactly one Unicode codepoint. */
+        return total_bytes / 4u;
+    }
+
+    /* ASCII: one byte is one codepoint. */
+    return total_bytes;
+}
+
+/*──────────────────────────────────────────────────────────────────────────────
+  LIFECYCLE
+──────────────────────────────────────────────────────────────────────────────*/
+
+b_str_t b_str_new_pro(const void *data, size_t byte_len, uint8_t encoding) {
+    byte_len = _align_len_down(byte_len, encoding);
+
+    const uint8_t type            = b_str_pick_type(byte_len);
+    const size_t  header_size     = b_str_hdr_size(type);
+    const size_t  null_term_size  = _null_term_size(encoding);
+
+    if (byte_len > SIZE_MAX - header_size - null_term_size) return NULL;
+
+    uint8_t *mem = (uint8_t*)SDL_malloc(header_size + byte_len + null_term_size);
+    if (!mem) return NULL;
+
+    b_str_t s = mem + header_size;
+    s[-1] = (uint8_t)(type | B_STR_ALIGN_FLAG | (encoding & B_STR_ENC_MASK));
+
+    if      (data)         memcpy(s, data, byte_len);
+    else if (byte_len > 0) memset(s, 0,    byte_len);
+
+    b_str_set_lens(s, byte_len, byte_len);
+    _write_null_terminator(s, byte_len, null_term_size);
+    return s;
+}
+
+b_str_t b_str_new(const char *cstr) {
+    return b_str_new_pro(cstr, cstr ? strlen(cstr) : 0, B_STR_ENC_ASCII);
+}
+
+b_str_t b_str_new_static_pro(const void *data, size_t byte_len,
+                              size_t total_capacity, uint8_t encoding) {
+    byte_len       = _align_len_down(byte_len,       encoding);
+    total_capacity = _align_len_down(total_capacity, encoding);
+    if (byte_len > total_capacity) return NULL;
+
+    const uint8_t type           = b_str_pick_type(total_capacity);
+    const size_t  header_size    = b_str_hdr_size(type);
+    const size_t  null_term_size = _null_term_size(encoding);
+
+    if (total_capacity > SIZE_MAX - header_size - null_term_size) return NULL;
+
+    uint8_t *mem = (uint8_t*)SDL_malloc(header_size + total_capacity + null_term_size);
+    if (!mem) return NULL;
+
+    b_str_t s = mem + header_size;
+    s[-1] = (uint8_t)(type | B_STR_ALIGN_FLAG | B_STR_STATIC
+                      | (encoding & B_STR_ENC_MASK));
+
+    if      (data)         memcpy(s, data, byte_len);
+    else if (byte_len > 0) memset(s, 0,    byte_len);
+
+    b_str_set_lens(s, byte_len, total_capacity);
+    _write_null_terminator(s, byte_len, null_term_size);
+    return s;
+}
+
+b_str_t b_str_new_static(const char *cstr, size_t extra_bytes) {
+    const size_t byte_len = cstr ? strlen(cstr) : 0;
+    if (byte_len > SIZE_MAX - extra_bytes) return NULL;
+    return b_str_new_static_pro(cstr, byte_len, byte_len + extra_bytes,
+                                B_STR_ENC_ASCII);
+}
+
+void b_str_free(b_str_t s) {
+    if (s) SDL_free((uint8_t*)s - b_str_hdr_size(s[-1]));
+}
+
+b_str_t b_str_dup(b_cstr_t s) {
+    return s ? b_str_new_pro(s, b_str_len(s), b_str_enc(s)) : NULL;
+}
+
+void b_str_clear(b_str_t s) {
+    if (!s) return;
+    const size_t null_term_size = _null_term_size(b_str_enc(s));
+    b_str_set_len(s, 0);
+    _write_null_terminator(s, 0, null_term_size);
+}
+
+bool b_str_empty(b_cstr_t s) { return !s || b_str_len(s) == 0; }
+
+b_str_t b_str_to_dyn(b_str_t s) {
+    if (!s || !(s[-1] & B_STR_STATIC)) return s;
+    b_str_t dynamic_copy = b_str_new_pro(s, b_str_len(s), b_str_enc(s));
+    if (!dynamic_copy) return s;  /* return original on allocation failure */
+    b_str_free(s);
+    return dynamic_copy;
+}
+
+/*──────────────────────────────────────────────────────────────────────────────
+  SLICE CONSTRUCTORS
+──────────────────────────────────────────────────────────────────────────────*/
+
+b_str_t b_str_from_slice   (b_slice_t    slice) { return b_str_new_pro(slice.data, slice.len, B_STR_ENC_ASCII);  }
+b_str_t b_str_from_u8slice (b_u8slice_t  slice) { return b_str_new_pro(slice.data, slice.len, B_STR_ENC_UTF8);   }
+b_str_t b_str_from_u16slice(b_u16slice_t slice) {
+    /* Align down to a whole number of UTF-16 code units (2 bytes each). */
+    return b_str_new_pro(slice.data, slice.len & ~(size_t)1u, B_STR_ENC_UTF16LE);
+}
+b_str_t b_str_from_u32slice(b_u32slice_t slice) {
+    /* Align down to a whole number of UTF-32 code units (4 bytes each). */
+    return b_str_new_pro(slice.data, slice.len & ~(size_t)3u, B_STR_ENC_UTF32LE);
+}
+
+b_str_t b_str_from_u16(const uint16_t *units, size_t unit_count) {
+    if (!units && unit_count > 0) return NULL;
+    if (unit_count > SIZE_MAX / 2u) return NULL;
+    return b_str_new_pro(units, unit_count * 2u, B_STR_ENC_UTF16LE);
+}
+
+b_str_t b_str_from_u32(const uint32_t *units, size_t unit_count) {
+    if (!units && unit_count > 0) return NULL;
+    if (unit_count > SIZE_MAX / 4u) return NULL;
+    return b_str_new_pro(units, unit_count * 4u, B_STR_ENC_UTF32LE);
+}
+
+/*──────────────────────────────────────────────────────────────────────────────
+  CAPACITY MANAGEMENT
+──────────────────────────────────────────────────────────────────────────────*/
+
+b_str_t b_str_ensure(b_str_t s, size_t extra_bytes) {
+    if (!s)                               return NULL;
+    if (b_str_avail(s) >= extra_bytes)    return s;
+    if (s[-1] & B_STR_STATIC)            return s;  /* static strings never grow */
+
+    const uint8_t encoding       = b_str_enc(s);
+    const size_t  null_term_size = _null_term_size(encoding);
+    const size_t  current_len    = b_str_len(s);
+    const size_t  current_cap    = b_str_cap(s);
+
+    if (extra_bytes > SIZE_MAX - current_len) return s;
+    size_t needed_cap = _align_cap_up(current_len + extra_bytes, encoding);
+
+    /* Growth strategy: double below 1 MB, add 1 MB chunks above. */
+    size_t new_cap = needed_cap;
+    if (new_cap < B_STR_ONE_MEG) {
+        const size_t doubled = (current_cap > SIZE_MAX / 2u)
+                               ? SIZE_MAX : current_cap * 2u;
+        if (doubled > new_cap) new_cap = doubled;
+    } else {
+        new_cap = (SIZE_MAX - B_STR_ONE_MEG >= new_cap)
+                  ? new_cap + B_STR_ONE_MEG : SIZE_MAX;
+    }
+    new_cap = _align_cap_up(new_cap, encoding);
+
+    uint8_t new_type       = b_str_pick_type(new_cap);
+    size_t  new_header_size = b_str_hdr_size(new_type);
+
+    /* Overflow clamp: ensure the total allocation fits in size_t. */
+    if (new_cap > SIZE_MAX - new_header_size - null_term_size) {
+        new_cap = _align_len_down(SIZE_MAX - new_header_size - null_term_size,
+                                  encoding);
+        new_type        = b_str_pick_type(new_cap);
+        new_header_size = b_str_hdr_size(new_type);
+        if (new_cap < needed_cap) return s;  /* truly out of addressable space */
+    }
+
+    const uint8_t current_type       = (uint8_t)(s[-1] & B_STR_TYPE_MASK);
+    const size_t  current_header_size = b_str_hdr_size(current_type);
+    uint8_t *mem;
+
+    if (current_type == new_type) {
+        /* Same header size: realloc in place. */
+        mem = (uint8_t*)SDL_realloc(s - current_header_size,
+                                    new_header_size + new_cap + null_term_size);
+        if (!mem) return s;
+        s = mem + new_header_size;
+        /* s[-1] (flags byte) is preserved by SDL_realloc. */
+    } else {
+        /* Header size is changing: alloc new block, copy data, free old. */
+        mem = (uint8_t*)SDL_malloc(new_header_size + new_cap + null_term_size);
+        if (!mem) return s;
+        memcpy(mem + new_header_size, s, current_len + null_term_size);
+        SDL_free(s - current_header_size);
+        s = mem + new_header_size;
+        /* Set new flags: new type | align flag | encoding; clear STATIC. */
+        s[-1] = (uint8_t)(new_type | B_STR_ALIGN_FLAG | encoding);
+    }
+
+    b_str_set_lens(s, current_len, new_cap);
+    return s;
+}
+
+b_str_t b_str_reserve(b_str_t s, size_t extra_bytes) {
+    return b_str_ensure(s, extra_bytes);
+}
+
+b_str_t b_str_fit(b_str_t s) {
+    if (!s || (s[-1] & B_STR_STATIC)) return s;
+
+    const uint8_t encoding          = b_str_enc(s);
+    const size_t  used_bytes        = b_str_len(s);
+    const uint8_t current_type      = (uint8_t)(s[-1] & B_STR_TYPE_MASK);
+    const size_t  current_hdr_size  = b_str_hdr_size(current_type);
+    const size_t  null_term_size    = _null_term_size(encoding);
+    const uint8_t tightest_type     = b_str_pick_type(used_bytes);
+    const size_t  tightest_hdr_size = b_str_hdr_size(tightest_type);
+
+    if (current_type == tightest_type) {
+        /* Same header size: shrink in place. */
+        uint8_t *mem = (uint8_t*)SDL_realloc(s - current_hdr_size,
+                                             current_hdr_size + used_bytes
+                                             + null_term_size);
+        if (!mem) return s;
+        s = mem + current_hdr_size;
+    } else {
+        /* Header size changing: alloc, copy, free. */
+        uint8_t *mem = (uint8_t*)SDL_malloc(tightest_hdr_size + used_bytes
+                                            + null_term_size);
+        if (!mem) return s;
+        memcpy(mem + tightest_hdr_size, s, used_bytes + null_term_size);
+        SDL_free(s - current_hdr_size);
+        s = mem + tightest_hdr_size;
+        s[-1] = (uint8_t)(tightest_type | B_STR_ALIGN_FLAG | encoding);
+    }
+
+    b_str_set_lens(s, used_bytes, used_bytes);
+    _write_null_terminator(s, used_bytes, null_term_size);
+    return s;
+}
+
+void b_str_arr_fit(b_str_t *array, size_t count) {
+    if (!array) return;
+    for (size_t index = 0; index < count; index++)
+        if (array[index]) array[index] = b_str_fit(array[index]);
+}
+
+/*──────────────────────────────────────────────────────────────────────────────
+  APPENDING & CONCATENATION
+──────────────────────────────────────────────────────────────────────────────*/
+
+b_str_t b_str_append_pro(b_str_t s, const void *data, size_t byte_len) {
+    if (!s || !data || !byte_len) return s;
+
+    const uint8_t encoding       = b_str_enc(s);
+    const size_t  null_term_size = _null_term_size(encoding);
+    const size_t  current_len    = b_str_len(s);
+
+    byte_len = _align_len_down(byte_len, encoding);
+    if (!byte_len) return s;
+    if (byte_len > SIZE_MAX - current_len) return s;
+
+    /* Detect self-overlap: record the source offset before potential realloc. */
+    const uintptr_t source_addr = (uintptr_t)data;
+    const uintptr_t buffer_addr = (uintptr_t)s;
+    const bool is_overlap = (source_addr >= buffer_addr
+                              && source_addr < (uintptr_t)(s + current_len
+                                                            + null_term_size));
+    const ptrdiff_t overlap_offset = is_overlap
+        ? (ptrdiff_t)((const uint8_t*)data - s) : 0;
+
+    s = b_str_ensure(s, byte_len);
+    if (b_str_avail(s) < byte_len) return s;  /* OOM / static full */
+
+    memmove(s + current_len,
+            is_overlap ? (const void*)(s + overlap_offset) : data,
+            byte_len);
+
+    const size_t new_len = current_len + byte_len;
+    b_str_set_len(s, new_len);
+    _write_null_terminator(s, new_len, null_term_size);
+    return s;
+}
+
+b_str_t b_str_append(b_str_t s, const char *cstr) {
+    return b_str_append_pro(s, cstr, cstr ? strlen(cstr) : 0);
+}
+
+b_str_t b_str_append_sl(b_str_t s, b_slice_t slice) {
+    return slice.data ? b_str_append_pro(s, slice.data, slice.len) : s;
+}
+
+b_str_t b_str_append_u8(b_str_t s, b_u8slice_t slice) {
+    if (!slice.data || !slice.len) return s;
+    /* Promote ASCII string to UTF-8 before appending UTF-8 data. */
+    if (b_str_enc(s) == B_STR_ENC_ASCII) b_str_set_enc(s, B_STR_ENC_UTF8);
+    return b_str_append_pro(s, slice.data, slice.len);
+}
+
+b_str_t b_str_append_u16(b_str_t s, b_u16slice_t slice) {
+    const size_t aligned_len = slice.len & ~(size_t)1u;
+    return (slice.data && aligned_len)
+           ? b_str_append_pro(s, slice.data, aligned_len) : s;
+}
+
+b_str_t b_str_append_u32(b_str_t s, b_u32slice_t slice) {
+    const size_t aligned_len = slice.len & ~(size_t)3u;
+    return (slice.data && aligned_len)
+           ? b_str_append_pro(s, slice.data, aligned_len) : s;
+}
+
+b_str_t b_str_concat(b_cstr_t a, b_cstr_t b) {
+    const uint8_t encoding = a ? b_str_enc(a) : B_STR_ENC_ASCII;
+    const size_t  len_a    = a ? b_str_len(a) : 0;
+    const size_t  len_b    = b ? b_str_len(b) : 0;
+    if (len_a > SIZE_MAX - len_b) return NULL;
+
+    b_str_t result = b_str_new_pro(a, len_a, encoding);
+    if (!result) return NULL;
+    if (len_b) {
+        const size_t len_before_append = b_str_len(result);
+        result = b_str_append_pro(result, b, len_b);
+        if (b_str_len(result) == len_before_append) {
+            b_str_free(result);
+            return NULL;  /* append failed (OOM) */
+        }
+    }
+    return result;
+}
+
+/*──────────────────────────────────────────────────────────────────────────────
+  SLICE EXTRACTORS
+──────────────────────────────────────────────────────────────────────────────*/
+
+b_slice_t b_slice_of(b_cstr_t s) {
+    return (b_slice_t){s, b_str_len(s)};
+}
+
+b_slice_t b_subslice(b_cstr_t s, size_t byte_offset, size_t byte_len) {
+    b_slice_t empty = {NULL, 0};
+    if (!s) return empty;
+    const size_t total_bytes = b_str_len(s);
+    if (byte_offset >= total_bytes) return empty;
+    const size_t remaining = total_bytes - byte_offset;
+    return (b_slice_t){s + byte_offset, byte_len > remaining ? remaining : byte_len};
+}
+
+b_u8slice_t b_u8slice_of(b_cstr_t s) {
+    return (b_u8slice_t){s, b_str_len(s)};
+}
+
+b_u8slice_t b_u8subslice(b_cstr_t s, size_t byte_offset, size_t byte_len) {
+    b_u8slice_t empty = {NULL, 0};
+    if (!s) return empty;
+    const size_t total_bytes = b_str_len(s);
+    if (byte_offset >= total_bytes) return empty;
+    const size_t remaining = total_bytes - byte_offset;
+    return (b_u8slice_t){s + byte_offset, byte_len > remaining ? remaining : byte_len};
+}
+
+b_u8slice_t b_u8subslice_cp(b_cstr_t s, size_t codepoint_offset,
+                             size_t codepoint_count) {
+    b_u8slice_t empty = {NULL, 0};
+    if (!s) return empty;
+    const size_t total_bytes = b_str_len(s);
+    size_t byte_pos = 0;
+
+    /* Advance to the codepoint at codepoint_offset. */
+    for (size_t cp_index = 0; cp_index < codepoint_offset && byte_pos < total_bytes;
+         cp_index++) {
+        utf8proc_int32_t codepoint;
+        const size_t remaining = total_bytes - byte_pos;
+        const utf8proc_ssize_t advance = utf8proc_iterate(
+            s + byte_pos,
+            (utf8proc_ssize_t)(remaining < (size_t)SSIZE_MAX
+                               ? remaining : (size_t)SSIZE_MAX),
+            &codepoint);
+        byte_pos += (advance > 0) ? (size_t)advance : 1u;
+    }
+    if (byte_pos >= total_bytes && codepoint_offset > 0) return empty;
+
+    const size_t slice_start = byte_pos;
+
+    /* Advance over codepoint_count codepoints from the start position. */
+    for (size_t cp_index = 0; cp_index < codepoint_count && byte_pos < total_bytes;
+         cp_index++) {
+        utf8proc_int32_t codepoint;
+        const size_t remaining = total_bytes - byte_pos;
+        const utf8proc_ssize_t advance = utf8proc_iterate(
+            s + byte_pos,
+            (utf8proc_ssize_t)(remaining < (size_t)SSIZE_MAX
+                               ? remaining : (size_t)SSIZE_MAX),
+            &codepoint);
+        byte_pos += (advance > 0) ? (size_t)advance : 1u;
+    }
+    return (b_u8slice_t){s + slice_start, byte_pos - slice_start};
+}
+
+b_u16slice_t b_u16slice_of(b_cstr_t s) {
+    return (b_u16slice_t){s, b_str_len(s)};
+}
+
+b_u16slice_t b_u16subslice(b_cstr_t s, size_t byte_offset, size_t byte_len) {
+    b_u16slice_t empty = {NULL, 0};
+    if (!s) return empty;
+    /* Align to 2-byte code-unit boundaries. */
+    byte_offset &= ~(size_t)1u;
+    byte_len    &= ~(size_t)1u;
+    const size_t total_bytes = b_str_len(s) & ~(size_t)1u;
+    if (byte_offset >= total_bytes) return empty;
+    const size_t remaining = total_bytes - byte_offset;
+    return (b_u16slice_t){s + byte_offset,
+                          byte_len > remaining ? remaining : byte_len};
+}
+
+b_u16slice_t b_u16subslice_cp(b_cstr_t s, size_t codepoint_offset,
+                               size_t codepoint_count) {
+    b_u16slice_t empty = {NULL, 0};
+    if (!s) return empty;
+    const bool   is_big_endian = (b_str_enc(s) == B_STR_ENC_UTF16BE);
+    const size_t unit_count    = b_str_len(s) / 2u;
+    size_t unit_index = 0;
+
+    /* Skip codepoint_offset codepoints. */
+    for (size_t cp_index = 0; cp_index < codepoint_offset && unit_index < unit_count;
+         cp_index++) {
+        uint16_t first_unit = _read_u16(s + unit_index * 2u);
+        if (is_big_endian) first_unit = _byte_swap_16(first_unit);
+        unit_index++;
+        if (first_unit >= 0xD800u && first_unit <= 0xDBFFu
+                && unit_index < unit_count) {
+            uint16_t second_unit = _read_u16(s + unit_index * 2u);
+            if (is_big_endian) second_unit = _byte_swap_16(second_unit);
+            if (second_unit >= 0xDC00u && second_unit <= 0xDFFFu) unit_index++;
+        }
+    }
+    if (unit_index >= unit_count && codepoint_offset > 0) return empty;
+
+    const size_t slice_start_unit = unit_index;
+
+    /* Collect codepoint_count codepoints. */
+    for (size_t cp_index = 0; cp_index < codepoint_count && unit_index < unit_count;
+         cp_index++) {
+        uint16_t first_unit = _read_u16(s + unit_index * 2u);
+        if (is_big_endian) first_unit = _byte_swap_16(first_unit);
+        unit_index++;
+        if (first_unit >= 0xD800u && first_unit <= 0xDBFFu
+                && unit_index < unit_count) {
+            uint16_t second_unit = _read_u16(s + unit_index * 2u);
+            if (is_big_endian) second_unit = _byte_swap_16(second_unit);
+            if (second_unit >= 0xDC00u && second_unit <= 0xDFFFu) unit_index++;
+        }
+    }
+    return (b_u16slice_t){s + slice_start_unit * 2u,
+                          (unit_index - slice_start_unit) * 2u};
+}
+
+size_t b_u16slice_units(b_u16slice_t slice) { return slice.len / 2u; }
+
+/* ── UTF-32 slice extractors ─────────────────────────────────────────────── */
+
+b_u32slice_t b_u32slice_of(b_cstr_t s) {
+    return (b_u32slice_t){s, b_str_len(s)};
+}
+
+b_u32slice_t b_u32subslice(b_cstr_t s, size_t byte_offset, size_t byte_len) {
+    b_u32slice_t empty = {NULL, 0};
+    if (!s) return empty;
+    byte_offset &= ~(size_t)3u;
+    byte_len    &= ~(size_t)3u;
+    const size_t total_bytes = b_str_len(s) & ~(size_t)3u;
+    if (byte_offset >= total_bytes) return empty;
+    const size_t remaining = total_bytes - byte_offset;
+    return (b_u32slice_t){s + byte_offset,
+                          byte_len > remaining ? remaining : byte_len};
+}
+
+b_u32slice_t b_u32subslice_cp(b_cstr_t s, size_t codepoint_offset,
+                               size_t codepoint_count) {
+    b_u32slice_t empty = {NULL, 0};
+    if (!s) return empty;
+    const size_t total_bytes = b_str_len(s) & ~(size_t)3u;
+    const size_t unit_count  = total_bytes / 4u;
+    if (codepoint_offset >= unit_count) return empty;
+    const size_t available = unit_count - codepoint_offset;
+    const size_t actual_count = codepoint_count > available
+                                ? available : codepoint_count;
+    return (b_u32slice_t){s + codepoint_offset * 4u, actual_count * 4u};
+}
+
+size_t b_u32slice_units(b_u32slice_t slice) { return slice.len / 4u; }
+
+/* ── Generic codepoint-indexed subslice ─────────────────────────────────── */
+
+b_slice_t b_subslice_cp(b_cstr_t s, size_t codepoint_offset,
+                         size_t codepoint_count) {
+    b_slice_t empty = {NULL, 0};
+    if (!s) return empty;
+    const uint8_t encoding = b_str_enc(s);
+
+    if (B_STR_IS_UTF32_ENC(encoding)) {
+        b_u32slice_t u32 = b_u32subslice_cp(s, codepoint_offset, codepoint_count);
+        return (b_slice_t){u32.data, u32.len};
+    }
+    if (B_STR_IS_UTF16_ENC(encoding)) {
+        b_u16slice_t u16 = b_u16subslice_cp(s, codepoint_offset, codepoint_count);
+        return (b_slice_t){u16.data, u16.len};
+    }
+    if (encoding == B_STR_ENC_UTF8) {
+        b_u8slice_t u8 = b_u8subslice_cp(s, codepoint_offset, codepoint_count);
+        return (b_slice_t){u8.data, u8.len};
+    }
+    /* ASCII: one byte == one codepoint */
+    const size_t total_bytes = b_str_len(s);
+    if (codepoint_offset >= total_bytes) return empty;
+    const size_t remaining = total_bytes - codepoint_offset;
+    return (b_slice_t){s + codepoint_offset,
+                       codepoint_count > remaining ? remaining : codepoint_count};
+}
+
+/*──────────────────────────────────────────────────────────────────────────────
+  ENCODING CONVERTERS – SDL_iconv
+  "UTF-16LE", "UTF-16BE", "UTF-32LE", "UTF-32BE" never insert a BOM.
+
+  Bug notes:
+  • SDL_ICONV_EINVAL (= (size_t)-4) means the input ended with an incomplete
+    multibyte sequence.  For a complete b_str buffer this should not occur, but
+    we treat it as an error to avoid silently dropping the tail of the input.
+  • In practice SDL_iconv may also return SDL_ICONV_EILSEQ for individual
+    invalid sequences; those are also treated as hard errors.
+──────────────────────────────────────────────────────────────────────────────*/
+
+static b_str_t _b_iconv(b_cstr_t input, size_t input_byte_count,
+                         const char *from_encoding, const char *to_encoding,
+                         uint8_t output_encoding_tag) {
+    SDL_iconv_t conversion_descriptor = SDL_iconv_open(to_encoding,
+                                                        from_encoding);
+    if (conversion_descriptor == (SDL_iconv_t)-1) return NULL;
+
+    /* 4× headroom covers UTF-8→UTF-16 (×2) and UTF-8→UTF-32 (×4).
+     * Guard against overflow: input_byte_count must be < SIZE_MAX/4 - 2.  */
+    if (input_byte_count > (SIZE_MAX - 8u) / 4u) {
+        SDL_iconv_close(conversion_descriptor);
+        return NULL;
+    }
+    size_t   output_capacity = input_byte_count * 4u + 8u;
+    uint8_t *output_buffer   = (uint8_t*)SDL_malloc(output_capacity);
+    if (!output_buffer) {
+        SDL_iconv_close(conversion_descriptor);
+        return NULL;
+    }
+
+    const char *input_ptr     = (const char*)input;
+    size_t      input_remaining  = input_byte_count;
+    char       *output_ptr    = (char*)output_buffer;
+    size_t      output_remaining = output_capacity;
+
+    const size_t iconv_result = SDL_iconv(conversion_descriptor,
+                                           &input_ptr, &input_remaining,
+                                           &output_ptr, &output_remaining);
+    SDL_iconv_close(conversion_descriptor);
+
+    /* Check all four SDL_iconv error codes. */
+    if (iconv_result == SDL_ICONV_ERROR  ||
+        iconv_result == SDL_ICONV_E2BIG  ||
+        iconv_result == SDL_ICONV_EILSEQ ||
+        iconv_result == SDL_ICONV_EINVAL) {
+        SDL_free(output_buffer);
+        return NULL;
+    }
+
+    /* If any input bytes remain unconverted, the input was malformed. */
+    if (input_remaining != 0) {
+        SDL_free(output_buffer);
+        return NULL;
+    }
+
+    const size_t output_byte_count = output_capacity - output_remaining;
+    b_str_t result = b_str_new_pro(output_buffer, output_byte_count,
+                                    output_encoding_tag);
+    SDL_free(output_buffer);
+    return result;
+}
+
+b_str_t b_str_to_utf16(b_cstr_t s) {
+    if (!s) return NULL;
+    if (b_str_enc(s) == B_STR_ENC_UTF16LE) return b_str_dup(s);
+    /* Route any non-UTF-8 encoding through UTF-8 first. */
+    if (b_str_enc(s) == B_STR_ENC_UTF16BE
+            || B_STR_IS_UTF32_ENC(b_str_enc(s))) {
+        b_str_t intermediate = b_str_to_utf8(s);
+        if (!intermediate) return NULL;
+        b_str_t result = _b_iconv(intermediate, b_str_len(intermediate),
+                                   "UTF-8", "UTF-16LE", B_STR_ENC_UTF16LE);
+        b_str_free(intermediate);
+        return result;
+    }
+    /* ASCII or UTF-8 input: convert directly. */
+    return _b_iconv(s, b_str_len(s), "UTF-8", "UTF-16LE", B_STR_ENC_UTF16LE);
+}
+
+b_str_t b_str_to_utf16be(b_cstr_t s) {
+    if (!s) return NULL;
+    if (b_str_enc(s) == B_STR_ENC_UTF16BE) return b_str_dup(s);
+    if (B_STR_IS_UTF16_ENC(b_str_enc(s)) || B_STR_IS_UTF32_ENC(b_str_enc(s))) {
+        b_str_t intermediate = b_str_to_utf8(s);
+        if (!intermediate) return NULL;
+        b_str_t result = _b_iconv(intermediate, b_str_len(intermediate),
+                                   "UTF-8", "UTF-16BE", B_STR_ENC_UTF16BE);
+        b_str_free(intermediate);
+        return result;
+    }
+    return _b_iconv(s, b_str_len(s), "UTF-8", "UTF-16BE", B_STR_ENC_UTF16BE);
+}
+
+b_str_t b_str_to_utf32le(b_cstr_t s) {
+    if (!s) return NULL;
+    if (b_str_enc(s) == B_STR_ENC_UTF32LE) return b_str_dup(s);
+    if (B_STR_IS_UTF16_ENC(b_str_enc(s)) || b_str_enc(s) == B_STR_ENC_UTF32BE) {
+        b_str_t intermediate = b_str_to_utf8(s);
+        if (!intermediate) return NULL;
+        b_str_t result = _b_iconv(intermediate, b_str_len(intermediate),
+                                   "UTF-8", "UTF-32LE", B_STR_ENC_UTF32LE);
+        b_str_free(intermediate);
+        return result;
+    }
+    return _b_iconv(s, b_str_len(s), "UTF-8", "UTF-32LE", B_STR_ENC_UTF32LE);
+}
+
+b_str_t b_str_to_utf32be(b_cstr_t s) {
+    if (!s) return NULL;
+    if (b_str_enc(s) == B_STR_ENC_UTF32BE) return b_str_dup(s);
+    if (B_STR_IS_UTF16_ENC(b_str_enc(s)) || b_str_enc(s) == B_STR_ENC_UTF32LE) {
+        b_str_t intermediate = b_str_to_utf8(s);
+        if (!intermediate) return NULL;
+        b_str_t result = _b_iconv(intermediate, b_str_len(intermediate),
+                                   "UTF-8", "UTF-32BE", B_STR_ENC_UTF32BE);
+        b_str_free(intermediate);
+        return result;
+    }
+    return _b_iconv(s, b_str_len(s), "UTF-8", "UTF-32BE", B_STR_ENC_UTF32BE);
+}
+
+b_str_t b_str_to_utf8(b_cstr_t s) {
+    if (!s) return NULL;
+    const uint8_t encoding = b_str_enc(s);
+    /* ASCII and UTF-8 share the same byte layout; a dup + re-tag suffices. */
+    if (!B_STR_IS_UTF16_ENC(encoding) && !B_STR_IS_UTF32_ENC(encoding)) {
+        b_str_t result = b_str_dup(s);
+        if (result) b_str_set_enc(result, B_STR_ENC_UTF8);
+        return result;
+    }
+    const char *from_encoding;
+    if      (encoding == B_STR_ENC_UTF16BE) from_encoding = "UTF-16BE";
+    else if (encoding == B_STR_ENC_UTF16LE) from_encoding = "UTF-16LE";
+    else if (encoding == B_STR_ENC_UTF32BE) from_encoding = "UTF-32BE";
+    else                                    from_encoding = "UTF-32LE";
+    return _b_iconv(s, b_str_len(s), from_encoding, "UTF-8", B_STR_ENC_UTF8);
 }
 
 /*
-	* needs_swap  –  Decide whether byte-swapping is required for a UTF-16 operation.
-	*
-	* convey stores UTF-16 in native LE order by default.  When the caller requests
-	* a different endianness:
-	*   use_big_endian=false → data is/should be UTF-16 LE  (no swap on LE hosts)
-	*   use_big_endian=true  → data is/should be UTF-16 BE  (swap on LE hosts)
-	*
-	* Returns true when the requested endianness differs from the host byte order.
-	*/
-static inline bool needs_swap(bool use_big_endian) {
-	return use_big_endian == host_is_le();
+ * b_str_utf8_norm – NFC-normalise a NUL-terminated UTF-8 C-string.
+ *
+ * utf8proc_map allocates via the system allocator (malloc/free), not SDL.
+ * We copy its output into an SDL allocation before calling free().
+ * This is intentional: utf8proc is an external library and we cannot change
+ * its allocator.
+ */
+b_str_t b_str_utf8_norm(const char *null_terminated_utf8) {
+    if (!null_terminated_utf8) return NULL;
+    utf8proc_uint8_t *temp_ptr = NULL;
+    const utf8proc_ssize_t output_byte_count = utf8proc_map(
+        (const utf8proc_uint8_t*)null_terminated_utf8,
+        0,           /* 0 means "use NULLTERM option to find length" */
+        &temp_ptr,
+        (utf8proc_option_t)(UTF8PROC_NULLTERM | UTF8PROC_STABLE
+                            | UTF8PROC_COMPOSE));
+    if (output_byte_count < 0) {
+        free(temp_ptr);  /* utf8proc uses system malloc; must use free() here */
+        return NULL;
+    }
+    b_str_t result = b_str_new_pro(temp_ptr, (size_t)output_byte_count,
+                                    B_STR_ENC_UTF8);
+    free(temp_ptr);  /* same: system malloc, not SDL */
+    return result;
 }
 
-/*─────────────────────────────────────────────────────────────────────────────────
-	INTERNAL GETTERS & SETTERS
-	These read or write the packed header fields that live immediately before the
-	data pointer.  The switch on (string[-1] & C_STRING_TYPE_MASK) selects the
-	correct header struct width.
-─────────────────────────────────────────────────────────────────────────────────*/
+/*──────────────────────────────────────────────────────────────────────────────
+  CASE CONVERSION  –  UTF-8 / ASCII only
+  UTF-16 and UTF-32 strings are not supported and return NULL.
+──────────────────────────────────────────────────────────────────────────────*/
 
-size_t c_string_get_header_size(const unsigned char flags) {
-	switch (flags & C_STRING_TYPE_MASK) {
-	case C_STRING_TYPE_8:
-		return sizeof(struct c_string_header_8);
-	case C_STRING_TYPE_16:
-		return sizeof(struct c_string_header_16);
-	case C_STRING_TYPE_32:
-		return sizeof(struct c_string_header_32);
-	case C_STRING_TYPE_64:
-		return sizeof(struct c_string_header_64);
-	default:
-		return 0; /* unreachable; satisfies -Wreturn-type */
-	}
-}
+/*
+ * b_str_lower
+ *
+ * Performs Unicode case-folding using utf8proc_decompose_char with
+ * UTF8PROC_CASEFOLD | UTF8PROC_DECOMPOSE | UTF8PROC_COMPOSE.
+ * The DECOMPOSE flag ensures that characters requiring canonical decomposition
+ * before folding (e.g. some precomposed letters) are handled correctly.
+ * COMPOSE re-assembles the result into NFC, matching b_str_utf8_norm output.
+ *
+ * On invalid UTF-8 sequences: the offending byte is passed through unchanged
+ * (no replacement character is substituted).
+ */
+b_str_t b_str_lower(b_cstr_t s) {
+    if (!s) return NULL;
+    const uint8_t encoding = b_str_enc(s);
+    if (B_STR_IS_UTF16_ENC(encoding) || B_STR_IS_UTF32_ENC(encoding))
+        return NULL;
 
-unsigned char c_string_determine_type(const size_t size) {
-	/* Choose the smallest header class whose field width can store `size`. */
-	if (size < 256u)
-	return C_STRING_TYPE_8;
-	if (size < 65536u)
-	return C_STRING_TYPE_16;
-	if (size <= (size_t)UINT32_MAX)
-	return C_STRING_TYPE_32;
-	return C_STRING_TYPE_64;
-}
+    const size_t input_length = b_str_len(s);
+    /* Worst-case: each byte expands to at most 4 UTF-8 bytes after casefold. */
+    size_t   output_capacity = input_length * 4u + 16u;
+    uint8_t *output_buffer   = (uint8_t*)SDL_malloc(output_capacity);
+    if (!output_buffer) return NULL;
 
-unsigned char c_string_get_encoding(const c_const_string_t string) {
-	if (!string)
-	return C_STRING_ENC_ASCII;
-	return (unsigned char)(string[-1] & C_STRING_ENC_MASK);
-}
+    size_t input_position  = 0;
+    size_t output_position = 0;
 
-void c_string_set_encoding(c_string_t string, const unsigned char enc) {
-	if (!string)
-	return;
-	/* Clear the old encoding bits and OR in the new ones; leave all other bits untouched. */
-	string[-1] = (unsigned char)((string[-1] & ~C_STRING_ENC_MASK) | (enc & C_STRING_ENC_MASK));
-}
+    while (input_position < input_length) {
+        utf8proc_int32_t codepoint;
+        const size_t remaining = input_length - input_position;
+        const utf8proc_ssize_t advance = utf8proc_iterate(
+            s + input_position,
+            (utf8proc_ssize_t)(remaining < (size_t)SSIZE_MAX
+                               ? remaining : (size_t)SSIZE_MAX),
+            &codepoint);
 
-size_t c_string_get_used_length(const c_const_string_t string) {
-	if (!string)
-	return 0;
-	switch (string[-1] & C_STRING_TYPE_MASK) {
-	case C_STRING_TYPE_8:
-		return GET_CONST_HEADER_8(string)->used_length;
-	case C_STRING_TYPE_16:
-		return GET_CONST_HEADER_16(string)->used_length;
-	case C_STRING_TYPE_32:
-		return GET_CONST_HEADER_32(string)->used_length;
-	case C_STRING_TYPE_64:
-		return GET_CONST_HEADER_64(string)->used_length;
-	default:
-		return 0;
-	}
-}
+        /* On invalid sequence: pass the byte through unchanged. */
+        if (advance <= 0) {
+            if (output_position + 1u > output_capacity) {
+                output_capacity *= 2u;
+                uint8_t *resized = (uint8_t*)SDL_realloc(output_buffer,
+                                                          output_capacity);
+                if (!resized) { SDL_free(output_buffer); return NULL; }
+                output_buffer = resized;
+            }
+            output_buffer[output_position++] = s[input_position++];
+            continue;
+        }
+        input_position += (size_t)advance;
 
-size_t c_string_get_available_capacity(const c_const_string_t string) {
-	if (!string)
-	return 0;
-	switch (string[-1] & C_STRING_TYPE_MASK) {
-	case C_STRING_TYPE_8: {
-		const struct c_string_header_8* h = GET_CONST_HEADER_8(string);
-		return h->allocated_capacity > h->used_length ? (size_t)(h->allocated_capacity - h->used_length) : 0;
-	}
-	case C_STRING_TYPE_16: {
-		const struct c_string_header_16* h = GET_CONST_HEADER_16(string);
-		return h->allocated_capacity > h->used_length ? (size_t)(h->allocated_capacity - h->used_length) : 0;
-	}
-	case C_STRING_TYPE_32: {
-		const struct c_string_header_32* h = GET_CONST_HEADER_32(string);
-		return h->allocated_capacity > h->used_length ? (size_t)(h->allocated_capacity - h->used_length) : 0;
-	}
-	case C_STRING_TYPE_64: {
-		const struct c_string_header_64* h = GET_CONST_HEADER_64(string);
-		return h->allocated_capacity > h->used_length ? (size_t)(h->allocated_capacity - h->used_length) : 0;
-	}
-	default:
-		return 0;
-	}
-}
+        /* Decompose and casefold; may yield up to 4 codepoints. */
+        utf8proc_int32_t folded_codepoints[4];
+        int last_combining_class = 0;
+        const utf8proc_ssize_t fold_count = utf8proc_decompose_char(
+            codepoint,
+            folded_codepoints,
+            (utf8proc_ssize_t)(sizeof folded_codepoints
+                               / sizeof *folded_codepoints),
+            (utf8proc_option_t)(UTF8PROC_CASEFOLD | UTF8PROC_DECOMPOSE
+                                | UTF8PROC_COMPOSE),
+            &last_combining_class);
 
-size_t c_string_get_capacity(const c_const_string_t string) {
-	/* allocated_capacity = used_length + available_capacity */
-	if (!string)
-	return 0;
-	return c_string_get_used_length(string) + c_string_get_available_capacity(string);
-}
+        const int total_codepoints = (fold_count > 0) ? (int)fold_count : 1;
+        if (fold_count <= 0) folded_codepoints[0] = utf8proc_tolower(codepoint);
 
-void c_string_set_lengths(c_string_t string, size_t used, size_t capacity) {
-	if (!string)
-	return;
+        for (int fold_index = 0; fold_index < total_codepoints; fold_index++) {
+            /* Each encoded codepoint is at most 4 bytes in UTF-8. */
+            if (output_position + 4u > output_capacity) {
+                output_capacity = output_capacity * 2u + 16u;
+                uint8_t *resized = (uint8_t*)SDL_realloc(output_buffer,
+                                                          output_capacity);
+                if (!resized) { SDL_free(output_buffer); return NULL; }
+                output_buffer = resized;
+            }
+            const utf8proc_ssize_t bytes_written = utf8proc_encode_char(
+                folded_codepoints[fold_index], output_buffer + output_position);
+            if (bytes_written > 0)
+                output_position += (size_t)bytes_written;
+        }
+    }
 
-	/* UTF-16 invariant: both length values must be even (2-byte aligned). */
-	if ((string[-1] & C_STRING_ENC_MASK) == C_STRING_ENC_UTF16) {
-	used &= ~(size_t)1u;
-	capacity &= ~(size_t)1u;
-	}
-
-	switch (string[-1] & C_STRING_TYPE_MASK) {
-	case C_STRING_TYPE_8:
-		GET_HEADER_8(string)->used_length = (uint8_t)used;
-		GET_HEADER_8(string)->allocated_capacity = (uint8_t)capacity;
-		break;
-	case C_STRING_TYPE_16:
-		GET_HEADER_16(string)->used_length = (uint16_t)used;
-		GET_HEADER_16(string)->allocated_capacity = (uint16_t)capacity;
-		break;
-	case C_STRING_TYPE_32:
-		GET_HEADER_32(string)->used_length = (uint32_t)used;
-		GET_HEADER_32(string)->allocated_capacity = (uint32_t)capacity;
-		break;
-	case C_STRING_TYPE_64:
-		GET_HEADER_64(string)->used_length = (uint64_t)used;
-		GET_HEADER_64(string)->allocated_capacity = (uint64_t)capacity;
-		break;
-	}
-}
-
-void c_string_set_used_length(c_string_t string, size_t used) {
-	if (!string)
-	return;
-
-	/* UTF-16 invariant: used_length must be even. */
-	if ((string[-1] & C_STRING_ENC_MASK) == C_STRING_ENC_UTF16)
-	used &= ~(size_t)1u;
-
-	switch (string[-1] & C_STRING_TYPE_MASK) {
-	case C_STRING_TYPE_8:
-		GET_HEADER_8(string)->used_length = (uint8_t)used;
-		break;
-	case C_STRING_TYPE_16:
-		GET_HEADER_16(string)->used_length = (uint16_t)used;
-		break;
-	case C_STRING_TYPE_32:
-		GET_HEADER_32(string)->used_length = (uint32_t)used;
-		break;
-	case C_STRING_TYPE_64:
-		GET_HEADER_64(string)->used_length = (uint64_t)used;
-		break;
-	}
-}
-
-/*─────────────────────────────────────────────────────────────────────────────────
-	CODEPOINT COUNT
-─────────────────────────────────────────────────────────────────────────────────*/
-
-size_t c_string_codepoint_count(const c_const_string_t string) {
-	if (!string)
-	return 0;
-
-	const size_t total = c_string_get_used_length(string);
-	const unsigned char enc = c_string_get_encoding(string);
-
-	if (total == 0)
-	return 0;
-
-	if (enc == C_STRING_ENC_UTF8) {
-	size_t count = 0, pos = 0;
-	while (pos < total) {
-		utf8proc_int32_t cp;
-		/* Clamp the remaining byte count to utf8proc_ssize_t's positive range. */
-		const size_t rem = total - pos;
-		const utf8proc_ssize_t bound = (utf8proc_ssize_t)(rem > (size_t)SSIZE_MAX ? (size_t)SSIZE_MAX : rem);
-		const utf8proc_ssize_t adv = utf8proc_iterate(string + pos, bound, &cp);
-		if (adv <= 0) {
-		/* Invalid byte sequence: count the byte as one unit and advance past it. */
-		pos++;
-		} else {
-		pos += (size_t)adv;
-		}
-		count++;
-	}
-	return count;
-	}
-
-	if (enc == C_STRING_ENC_UTF16) {
-	/*
-		* Walk the code-unit stream, consuming surrogate pairs as a single
-		* codepoint.  Lone surrogates are counted as one codepoint each.
-		*/
-	const size_t total_units = total / 2;
-	size_t count = 0, unit_pos = 0;
-
-	while (unit_pos < total_units) {
-		const uint16_t u1 = c_read_u16(string + unit_pos * 2);
-		unit_pos++;
-
-		if (u1 >= 0xD800u && u1 <= 0xDBFFu && unit_pos < total_units) {
-		/* High surrogate: check whether a low surrogate follows. */
-		const uint16_t u2 = c_read_u16(string + unit_pos * 2);
-		if (u2 >= 0xDC00u && u2 <= 0xDFFFu)
-			unit_pos++; /* valid surrogate pair – consume the low unit */
-									/* else: lone high surrogate – already counted as one codepoint */
-		}
-		count++;
-	}
-	return count;
-	}
-
-	/* ASCII / raw: each byte is exactly one codepoint. */
-	return total;
-}
-
-/*─────────────────────────────────────────────────────────────────────────────────
-	SLICE EXTRACTORS
-─────────────────────────────────────────────────────────────────────────────────*/
-
-c_slice_t c_slice_of(const c_const_string_t string) {
-	c_slice_t s = {string, c_string_get_used_length(string)};
-	return s;
-}
-
-c_slice_t c_subslice(const c_const_string_t string, const size_t byte_offset, const size_t byte_length) {
-	c_slice_t s = {NULL, 0};
-	if (!string)
-	return s;
-
-	const size_t total = c_string_get_used_length(string);
-	if (byte_offset >= total)
-	return s;
-
-	const size_t remaining = total - byte_offset;
-	s.data = string + byte_offset;
-	s.length = byte_length > remaining ? remaining : byte_length;
-	return s;
-}
-
-c_utf8_slice_t c_utf8_slice_of(const c_const_string_t string) {
-	c_utf8_slice_t s = {string, c_string_get_used_length(string)};
-	return s;
-}
-
-c_utf8_slice_t c_utf8_subslice(const c_const_string_t string, const size_t byte_offset, const size_t byte_length) {
-	c_utf8_slice_t s = {NULL, 0};
-	if (!string)
-	return s;
-
-	const size_t total = c_string_get_used_length(string);
-	if (byte_offset >= total)
-	return s;
-
-	const size_t remaining = total - byte_offset;
-	s.data = string + byte_offset;
-	s.length = byte_length > remaining ? remaining : byte_length;
-	return s;
-}
-
-c_utf8_slice_t c_utf8_subslice_codepoints(const c_const_string_t string, const size_t cp_offset, const size_t cp_count) {
-	c_utf8_slice_t s = {NULL, 0};
-	if (!string)
-	return s;
-
-	const size_t total = c_string_get_used_length(string);
-	size_t pos = 0;
-
-	/* Skip cp_offset codepoints. */
-	for (size_t i = 0; i < cp_offset && pos < total; i++) {
-	utf8proc_int32_t cp;
-	const size_t rem = total - pos;
-	const utf8proc_ssize_t bound = (utf8proc_ssize_t)(rem > (size_t)SSIZE_MAX ? (size_t)SSIZE_MAX : rem);
-	const utf8proc_ssize_t adv = utf8proc_iterate(string + pos, bound, &cp);
-	pos += (adv > 0) ? (size_t)adv : 1u; /* advance past invalid byte if needed */
-	}
-
-	/* If cp_offset was non-zero but we've already exhausted the string, return empty. */
-	if (pos >= total && cp_offset > 0)
-	return s;
-	const size_t start = pos;
-
-	/* Collect cp_count codepoints starting from `pos`. */
-	for (size_t i = 0; i < cp_count && pos < total; i++) {
-	utf8proc_int32_t cp;
-	const size_t rem = total - pos;
-	const utf8proc_ssize_t bound = (utf8proc_ssize_t)(rem > (size_t)SSIZE_MAX ? (size_t)SSIZE_MAX : rem);
-	const utf8proc_ssize_t adv = utf8proc_iterate(string + pos, bound, &cp);
-	pos += (adv > 0) ? (size_t)adv : 1u;
-	}
-
-	s.data = string + start;
-	s.length = pos - start;
-	return s;
-}
-
-c_utf16_slice_t c_utf16_slice_of(const c_const_string_t string) {
-	c_utf16_slice_t s = {string, c_string_get_used_length(string)};
-	return s;
-}
-
-c_utf16_slice_t c_utf16_subslice(const c_const_string_t string, size_t byte_offset, size_t byte_length) {
-	c_utf16_slice_t s = {NULL, 0};
-	if (!string)
-	return s;
-
-	/* Round both values down to 2-byte boundaries (UTF-16 code-unit alignment). */
-	byte_offset &= ~(size_t)1u;
-	byte_length &= ~(size_t)1u;
-
-	const size_t total = c_string_get_used_length(string) & ~(size_t)1u;
-	if (byte_offset >= total)
-	return s;
-
-	const size_t remaining = total - byte_offset;
-	s.data = string + byte_offset;
-	s.length = byte_length > remaining ? remaining : byte_length;
-	return s;
-}
-
-c_utf16_slice_t c_utf16_subslice_codepoints(const c_const_string_t string, const size_t cp_offset, const size_t cp_count) {
-	c_utf16_slice_t s = {NULL, 0};
-	if (!string)
-	return s;
-
-	const size_t total_units = c_string_get_used_length(string) / 2;
-	size_t unit_pos = 0;
-
-	/* Skip cp_offset codepoints (surrogate-pair-aware). */
-	for (size_t i = 0; i < cp_offset && unit_pos < total_units; i++) {
-	const uint16_t u1 = c_read_u16(string + unit_pos * 2);
-	unit_pos++;
-	if (u1 >= 0xD800u && u1 <= 0xDBFFu && unit_pos < total_units) {
-		const uint16_t u2 = c_read_u16(string + unit_pos * 2);
-		if (u2 >= 0xDC00u && u2 <= 0xDFFFu)
-		unit_pos++;
-	}
-	}
-
-	if (unit_pos >= total_units && cp_offset > 0)
-	return s;
-	const size_t start_unit = unit_pos;
-
-	/* Collect cp_count codepoints. */
-	for (size_t i = 0; i < cp_count && unit_pos < total_units; i++) {
-	const uint16_t u1 = c_read_u16(string + unit_pos * 2);
-	unit_pos++;
-	if (u1 >= 0xD800u && u1 <= 0xDBFFu && unit_pos < total_units) {
-		const uint16_t u2 = c_read_u16(string + unit_pos * 2);
-		if (u2 >= 0xDC00u && u2 <= 0xDFFFu)
-		unit_pos++;
-	}
-	}
-
-	s.data = string + start_unit * 2;
-	s.length = (unit_pos - start_unit) * 2;
-	return s;
+    b_str_t result = b_str_new_pro(output_buffer, output_position,
+                                    B_STR_ENC_UTF8);
+    SDL_free(output_buffer);
+    return result;
 }
 
 /*
-	* c_subslice_codepoints  –  Universal encoding dispatcher.
-	* Delegates to the encoding-specific function selected by the string's tag, then
-	* repackages the result as a plain c_slice_t for callers that don't care about
-	* the encoding distinction.
-	*/
-c_slice_t c_subslice_codepoints(const c_const_string_t string, const size_t cp_offset, const size_t cp_count) {
-	c_slice_t result = {NULL, 0};
-	if (!string)
-	return result;
+ * b_str_upper
+ *
+ * Applies per-codepoint uppercase mapping via utf8proc_toupper.
+ * This is a simple (non-decomposing) uppercase: multi-codepoint uppercase
+ * expansions (rare edge cases) are not applied.  This is an inherent
+ * limitation of the utf8proc API for uppercasing; use b_str_lower for
+ * case-insensitive comparison instead.
+ *
+ * On invalid UTF-8 sequences: the offending byte is passed through unchanged.
+ */
+b_str_t b_str_upper(b_cstr_t s) {
+    if (!s) return NULL;
+    const uint8_t encoding = b_str_enc(s);
+    if (B_STR_IS_UTF16_ENC(encoding) || B_STR_IS_UTF32_ENC(encoding))
+        return NULL;
 
-	const unsigned char enc = c_string_get_encoding(string);
+    const size_t input_length = b_str_len(s);
+    size_t   output_capacity = input_length * 4u + 16u;
+    uint8_t *output_buffer   = (uint8_t*)SDL_malloc(output_capacity);
+    if (!output_buffer) return NULL;
 
-	if (enc == C_STRING_ENC_UTF16) {
-	const c_utf16_slice_t u16 = c_utf16_subslice_codepoints(string, cp_offset, cp_count);
-	result.data = u16.data;
-	result.length = u16.length;
-	return result;
-	}
+    size_t input_position  = 0;
+    size_t output_position = 0;
 
-	if (enc == C_STRING_ENC_UTF8) {
-	const c_utf8_slice_t u8 = c_utf8_subslice_codepoints(string, cp_offset, cp_count);
-	result.data = u8.data;
-	result.length = u8.length;
-	return result;
-	}
+    while (input_position < input_length) {
+        utf8proc_int32_t codepoint;
+        const size_t remaining = input_length - input_position;
+        const utf8proc_ssize_t advance = utf8proc_iterate(
+            s + input_position,
+            (utf8proc_ssize_t)(remaining < (size_t)SSIZE_MAX
+                               ? remaining : (size_t)SSIZE_MAX),
+            &codepoint);
 
-	/* ASCII / raw: each byte is one codepoint – direct pointer arithmetic. */
-	const size_t total = c_string_get_used_length(string);
-	if (cp_offset >= total)
-	return result;
+        /* On invalid sequence: pass the byte through unchanged. */
+        if (advance <= 0) {
+            if (output_position + 1u > output_capacity) {
+                output_capacity *= 2u;
+                uint8_t *resized = (uint8_t*)SDL_realloc(output_buffer,
+                                                          output_capacity);
+                if (!resized) { SDL_free(output_buffer); return NULL; }
+                output_buffer = resized;
+            }
+            output_buffer[output_position++] = s[input_position++];
+            continue;
+        }
+        input_position += (size_t)advance;
 
-	const size_t remaining = total - cp_offset;
-	result.data = string + cp_offset;
-	result.length = cp_count > remaining ? remaining : cp_count;
-	return result;
+        /* Ensure 4 bytes are available for the encoded uppercased codepoint. */
+        if (output_position + 4u > output_capacity) {
+            output_capacity = output_capacity * 2u + 16u;
+            uint8_t *resized = (uint8_t*)SDL_realloc(output_buffer,
+                                                      output_capacity);
+            if (!resized) { SDL_free(output_buffer); return NULL; }
+            output_buffer = resized;
+        }
+        const utf8proc_ssize_t bytes_written = utf8proc_encode_char(
+            utf8proc_toupper(codepoint), output_buffer + output_position);
+        if (bytes_written > 0) output_position += (size_t)bytes_written;
+    }
+
+    b_str_t result = b_str_new_pro(output_buffer, output_position,
+                                    B_STR_ENC_UTF8);
+    SDL_free(output_buffer);
+    return result;
 }
 
-size_t c_utf16_slice_unit_count(const c_utf16_slice_t slice) {
-	return slice.length / 2;
+/*──────────────────────────────────────────────────────────────────────────────
+  COMPARISON & SEARCH
+──────────────────────────────────────────────────────────────────────────────*/
+
+int b_str_cmp(b_cstr_t a, b_cstr_t b) {
+    if (a == b) return 0;
+    if (!a) return -1;
+    if (!b) return  1;
+    const size_t len_a = b_str_len(a), len_b = b_str_len(b);
+    const int    cmp_result = memcmp(a, b, len_a < len_b ? len_a : len_b);
+    if (cmp_result) return cmp_result;
+    return (len_a < len_b) ? -1 : (len_a > len_b) ? 1 : 0;
 }
 
-/*─────────────────────────────────────────────────────────────────────────────────
-	STRING LIFECYCLE & CONSTRUCTORS
-─────────────────────────────────────────────────────────────────────────────────*/
-
-c_string_t c_string_create_pro(const void* const initial_data, size_t initial_length, const unsigned char encoding) {
-	/* UTF-16 lengths must be even (each code unit is 2 bytes). */
-	if ((encoding & C_STRING_ENC_MASK) == C_STRING_ENC_UTF16)
-	initial_length &= ~(size_t)1u;
-
-	const unsigned char type = c_string_determine_type(initial_length);
-	const size_t header_size = c_string_get_header_size(type);
-	const size_t null_bytes = null_size_for(encoding);
-
-	/* Guard against arithmetic overflow in the total allocation size. */
-	if (initial_length > SIZE_MAX - header_size - null_bytes)
-	return NULL;
-
-	uint8_t* const memory = (uint8_t*)C_STRING_MALLOC(header_size + initial_length + null_bytes);
-	if (!memory)
-	return NULL;
-
-	c_string_t string = memory + header_size;
-
-	/*
-	* Pack type, static flag (0 = dynamic), and encoding into type_flags.
-	* The IS_STATIC bit is 0 here; c_string_create_static_pro sets it.
-	*/
-	string[-1] = (unsigned char)(type | (encoding & C_STRING_ENC_MASK));
-
-	if (initial_data) {
-	memcpy(string, initial_data, initial_length);
-	} else if (initial_length > 0) {
-	memset(string, 0, initial_length);
-	}
-
-	c_string_set_lengths(string, initial_length, initial_length);
-
-	/* Write NUL terminator(s) immediately after the data. */
-	string[initial_length] = '\0';
-	if (null_bytes == 2)
-	string[initial_length + 1] = '\0';
-
-	return string;
+bool b_str_eq(b_cstr_t a, b_cstr_t b) {
+    if (a == b) return true;
+    if (!a || !b) return false;
+    const size_t len_a = b_str_len(a);
+    return len_a == b_str_len(b) && memcmp(a, b, len_a) == 0;
 }
 
-c_string_t c_string_create_static_pro(const void* const initial_data, size_t initial_length, size_t total_capacity, const unsigned char encoding) {
-	if ((encoding & C_STRING_ENC_MASK) == C_STRING_ENC_UTF16) {
-	initial_length &= ~(size_t)1u;
-	total_capacity &= ~(size_t)1u;
-	}
-
-	if (initial_length > total_capacity)
-	return NULL;
-
-	const unsigned char type = c_string_determine_type(total_capacity);
-	const size_t header_size = c_string_get_header_size(type);
-	const size_t null_bytes = null_size_for(encoding);
-
-	if (total_capacity > SIZE_MAX - header_size - null_bytes)
-	return NULL;
-
-	uint8_t* const memory = (uint8_t*)C_STRING_MALLOC(header_size + total_capacity + null_bytes);
-	if (!memory)
-	return NULL;
-
-	c_string_t string = memory + header_size;
-
-	/* OR in the IS_STATIC flag alongside the type and encoding bits. */
-	string[-1] = (unsigned char)(type | C_STRING_IS_STATIC | (encoding & C_STRING_ENC_MASK));
-
-	if (initial_data) {
-	memcpy(string, initial_data, initial_length);
-	} else if (initial_length > 0) {
-	memset(string, 0, initial_length);
-	}
-
-	c_string_set_lengths(string, initial_length, total_capacity);
-
-	string[initial_length] = '\0';
-	if (null_bytes == 2)
-	string[initial_length + 1] = '\0';
-
-	return string;
+size_t b_str_find(b_cstr_t haystack, b_cstr_t needle) {
+    if (!haystack || !needle) return SIZE_MAX;
+    const size_t haystack_length = b_str_len(haystack);
+    const size_t needle_length   = b_str_len(needle);
+    if (!needle_length) return 0;
+    if (needle_length > haystack_length) return SIZE_MAX;
+    const size_t search_limit = haystack_length - needle_length;
+    for (size_t byte_offset = 0; byte_offset <= search_limit; byte_offset++)
+        if (memcmp(haystack + byte_offset, needle, needle_length) == 0)
+            return byte_offset;
+    return SIZE_MAX;
 }
 
-c_string_t c_string_create(const char* const string_parameter) {
-	return c_string_create_pro(string_parameter, string_parameter ? strlen(string_parameter) : 0, C_STRING_ENC_ASCII);
+bool b_str_contains(b_cstr_t s, b_cstr_t needle) {
+    return b_str_find(s, needle) != SIZE_MAX;
 }
 
-c_string_t c_string_create_static(const char* const string_parameter, const size_t extra_capacity) {
-	const size_t len = string_parameter ? strlen(string_parameter) : 0;
-	if (len > SIZE_MAX - extra_capacity)
-	return NULL;
-	return c_string_create_static_pro(string_parameter, len, len + extra_capacity, C_STRING_ENC_ASCII);
+bool b_str_starts_with(b_cstr_t s, b_cstr_t prefix) {
+    if (!s || !prefix) return false;
+    const size_t prefix_length = b_str_len(prefix);
+    return !prefix_length
+           || (prefix_length <= b_str_len(s)
+               && memcmp(s, prefix, prefix_length) == 0);
 }
 
-void c_string_free(c_string_t string) {
-	if (!string)
-	return;
-	/* Walk back past the header to the original malloc'd base pointer. */
-	C_STRING_FREE((uint8_t*)string - c_string_get_header_size(string[-1]));
+bool b_str_ends_with(b_cstr_t s, b_cstr_t suffix) {
+    if (!s || !suffix) return false;
+    const size_t string_length = b_str_len(s);
+    const size_t suffix_length = b_str_len(suffix);
+    return !suffix_length
+           || (suffix_length <= string_length
+               && memcmp(s + string_length - suffix_length, suffix,
+                         suffix_length) == 0);
 }
 
-c_string_t c_string_duplicate(const c_const_string_t string) {
-	if (!string)
-	return NULL;
-	/*
-	* The duplicate is always dynamic.  Static strings are intentionally
-	* not preserved here: the copy can grow freely, which is the safer default.
-	*/
-	return c_string_create_pro(string, c_string_get_used_length(string), c_string_get_encoding(string));
-}
-
-void c_string_clear(c_string_t string) {
-	if (!string)
-	return;
-	const unsigned char enc = c_string_get_encoding(string);
-	const size_t null_bytes = null_size_for(enc);
-	c_string_set_used_length(string, 0);
-	string[0] = '\0';
-	if (null_bytes == 2)
-	string[1] = '\0';
-}
-
-bool c_string_is_empty(const c_const_string_t string) {
-	return !string || c_string_get_used_length(string) == 0;
-}
-
-/*─────────────────────────────────────────────────────────────────────────────────
-	SLICE CONSTRUCTORS
-─────────────────────────────────────────────────────────────────────────────────*/
-
-c_string_t c_string_from_slice(const c_slice_t slice) {
-	return c_string_create_pro(slice.data, slice.length, C_STRING_ENC_ASCII);
-}
-
-c_string_t c_string_from_utf8_slice(const c_utf8_slice_t slice) {
-	return c_string_create_pro(slice.data, slice.length, C_STRING_ENC_UTF8);
-}
-
-c_string_t c_string_from_utf16_slice(const c_utf16_slice_t slice) {
-	/* Round down to even to ensure valid UTF-16 byte alignment. */
-	const size_t byte_len = slice.length & ~(size_t)1u;
-	return c_string_create_pro(slice.data, byte_len, C_STRING_ENC_UTF16);
-}
-
-c_string_t c_string_create_from_utf16(const uint16_t* const units, const size_t unit_count) {
-	if (!units && unit_count > 0)
-	return NULL;
-	if (unit_count > SIZE_MAX / 2)
-	return NULL; /* overflow guard */
-	return c_string_create_pro(units, unit_count * 2u, C_STRING_ENC_UTF16);
-}
-
-/*─────────────────────────────────────────────────────────────────────────────────
-	CAPACITY MANAGEMENT
-─────────────────────────────────────────────────────────────────────────────────*/
-
-c_string_t c_string_ensure_capacity(c_string_t string, const size_t additional_bytes) {
-	if (!string)
-	return NULL;
-	if (c_string_get_available_capacity(string) >= additional_bytes)
-	return string;
-
-	/* Static strings have fixed capacity; cannot reallocate. */
-	if (string[-1] & C_STRING_IS_STATIC)
-	return string;
-
-	const size_t current_length = c_string_get_used_length(string);
-	const unsigned char encoding = c_string_get_encoding(string);
-	const size_t null_bytes = null_size_for(encoding);
-	const size_t current_capacity = current_length + c_string_get_available_capacity(string);
-
-	/* Check that the needed size does not overflow size_t. */
-	if (additional_bytes > SIZE_MAX - current_length)
-	return string;
-
-	size_t needed = current_length + additional_bytes;
-
-	/* Preserve the UTF-16 even-byte invariant in the computed growth target. */
-	if (encoding == C_STRING_ENC_UTF16)
-	needed = (needed + 1u) & ~(size_t)1u;
-
-	/*
-	* Growth policy:
-	*   · Below 1 MB: double the current capacity (amortised O(1) appends).
-	*   · At or above 1 MB: add 1 MB per step (avoids huge over-allocations).
-	*/
-	size_t new_capacity = needed;
-	if (new_capacity < C_STRING_ONE_MEGABYTE) {
-	const size_t doubled = (current_capacity > SIZE_MAX / 2) ? SIZE_MAX : current_capacity * 2u;
-	if (doubled > new_capacity)
-		new_capacity = doubled;
-	} else {
-	if (SIZE_MAX - C_STRING_ONE_MEGABYTE >= new_capacity)
-		new_capacity += C_STRING_ONE_MEGABYTE;
-	else
-		new_capacity = SIZE_MAX;
-	}
-
-	unsigned char new_type = c_string_determine_type(new_capacity);
-	size_t new_header_size = c_string_get_header_size(new_type);
-
-	/* Final overflow clamp: ensure header + data + NUL fits in size_t. */
-	if (new_capacity > SIZE_MAX - new_header_size - null_bytes) {
-	new_capacity = SIZE_MAX - new_header_size - null_bytes;
-
-	if (encoding == C_STRING_ENC_UTF16)
-		new_capacity &= ~(size_t)1u;
-
-	/* Recompute type and header size after the clamp, then verify. */
-	new_type = c_string_determine_type(new_capacity);
-	new_header_size = c_string_get_header_size(new_type);
-	if (new_capacity > SIZE_MAX - new_header_size - null_bytes || new_capacity < needed) {
-		return string; /* completely unserviceable – leave string intact */
-	}
-	}
-
-	const unsigned char current_type = (unsigned char)(string[-1] & C_STRING_TYPE_MASK);
-	const size_t current_header_size = c_string_get_header_size(current_type);
-	uint8_t* new_memory;
-
-	if (current_type == new_type) {
-	/*
-		* Header class is unchanged – realloc in-place.
-		* The header content (type_flags, used_length, etc.) is preserved by
-		* realloc; c_string_set_lengths below updates allocated_capacity.
-		*/
-	new_memory = (uint8_t*)C_STRING_REALLOC(string - current_header_size, new_header_size + new_capacity + null_bytes);
-	if (!new_memory)
-		return string;
-	string = new_memory + new_header_size;
-	} else {
-	/*
-		* Header class grew to accommodate the new capacity.
-		* malloc a new block, copy the data, then free the old block.
-		* The IS_STATIC bit is intentionally NOT set here (we've already
-		* confirmed above that static strings cannot reach this path).
-		*/
-	new_memory = (uint8_t*)C_STRING_MALLOC(new_header_size + new_capacity + null_bytes);
-	if (!new_memory)
-		return string;
-	memcpy(new_memory + new_header_size, string, current_length + null_bytes);
-	C_STRING_FREE(string - current_header_size);
-	string = new_memory + new_header_size;
-	string[-1] = (unsigned char)(new_type | encoding); /* IS_STATIC bit = 0 */
-	}
-
-	c_string_set_lengths(string, current_length, new_capacity);
-	return string;
-}
-
-c_string_t c_string_reserve(c_string_t string, const size_t additional_bytes) {
-	return c_string_ensure_capacity(string, additional_bytes);
-}
-
-c_string_t c_string_shrink_to_fit(c_string_t string) {
-	if (!string)
-	return NULL;
-	if (string[-1] & C_STRING_IS_STATIC)
-	return string; /* no-op for static strings */
-
-	const unsigned char type = (unsigned char)(string[-1] & C_STRING_TYPE_MASK);
-	const unsigned char enc = c_string_get_encoding(string);
-	const size_t used = c_string_get_used_length(string);
-	const size_t header_size = c_string_get_header_size(type);
-	const size_t null_bytes = null_size_for(enc);
-
-	/* Determine the smallest header class that can still represent `used`. */
-	const unsigned char new_type = c_string_determine_type(used);
-	const size_t new_header_size = c_string_get_header_size(new_type);
-
-	if (new_type == type) {
-	/* Same header class: realloc to trim the tail. */
-	uint8_t* const new_memory = (uint8_t*)C_STRING_REALLOC(string - header_size, header_size + used + null_bytes);
-	if (!new_memory)
-		return string;
-	string = new_memory + header_size;
-	} else {
-	/* Header class shrank: malloc a smaller block, copy, free the old one. */
-	uint8_t* const new_memory = (uint8_t*)C_STRING_MALLOC(new_header_size + used + null_bytes);
-	if (!new_memory)
-		return string;
-	memcpy(new_memory + new_header_size, string, used + null_bytes);
-	C_STRING_FREE(string - header_size);
-	string = new_memory + new_header_size;
-	string[-1] = (unsigned char)(new_type | enc); /* IS_STATIC bit = 0 */
-	}
-
-	c_string_set_lengths(string, used, used);
-
-	/* Rewrite the NUL terminator(s) in case the block moved or was trimmed. */
-	string[used] = '\0';
-	if (null_bytes == 2)
-	string[used + 1] = '\0';
-
-	return string;
-}
-
-void c_string_array_shrink_to_fit(c_string_t* const array, const size_t count) {
-	if (!array || count == 0)
-	return;
-	for (size_t i = 0; i < count; i++) {
-	if (array[i])
-		array[i] = c_string_shrink_to_fit(array[i]);
-	}
-}
-
-/*─────────────────────────────────────────────────────────────────────────────────
-	APPENDING & CONCATENATION
-─────────────────────────────────────────────────────────────────────────────────*/
-
-c_string_t c_string_append_pro(c_string_t string, const void* const data, size_t length) {
-	if (!string || !data || length == 0)
-	return string;
-
-	const size_t current_length = c_string_get_used_length(string);
-	const unsigned char encoding = c_string_get_encoding(string);
-	const size_t null_bytes = null_size_for(encoding);
-
-	/* UTF-16: discard the last byte if an odd count was passed. */
-	if (encoding == C_STRING_ENC_UTF16) {
-	length &= ~(size_t)1u;
-	if (length == 0)
-		return string;
-	}
-
-	if (length > SIZE_MAX - current_length)
-	return string; /* overflow guard */
-
-	/*
-	* Self-overlap detection.
-	*
-	* If `data` points into the same character buffer we're about to grow,
-	* a reallocation that moves the buffer would leave `data` dangling.
-	* We detect this BEFORE the potential realloc by recording `data`'s byte
-	* offset relative to string[0].  After the realloc the offset is still
-	* valid and we can reconstruct the new absolute pointer.
-	*
-	* buf_start is string[0] (not the header base): we only need to detect
-	* overlaps into the live character region.  Appending from within the
-	* header bytes is a programming error and not supported.
-	*/
-	const uintptr_t src_start = (uintptr_t)data;
-	const uintptr_t buf_start = (uintptr_t)string;
-	const uintptr_t buf_end = (uintptr_t)(string + current_length + null_bytes);
-	const bool is_overlap = (src_start >= buf_start && src_start < buf_end);
-	const ptrdiff_t src_offset = is_overlap ? (ptrdiff_t)((const uint8_t*)data - string) : 0;
-
-	/*
-	* Grow the buffer.  On failure, c_string_ensure_capacity returns the original
-	* pointer unmodified (invariant: available_capacity is then still < length).
-	*/
-	string = c_string_ensure_capacity(string, length);
-	if (c_string_get_available_capacity(string) < length) {
-	/*
-		* Could not grow (OOM or static string with full capacity).
-		* Return the original pointer – no data was lost or modified.
-		* Note: ensure_capacity returns the original on failure, so `string`
-		* here is still valid even if the header class could not change.
-		*/
-	return string;
-	}
-
-	/* If the buffer moved, rebase the source pointer using the saved offset. */
-	const void* const src = is_overlap ? (const void*)(string + src_offset) : data;
-	memmove(string + current_length, src, length);
-
-	const size_t new_length = current_length + length;
-	c_string_set_used_length(string, new_length);
-	string[new_length] = '\0';
-	if (null_bytes == 2)
-	string[new_length + 1] = '\0';
-
-	return string;
-}
-
-c_string_t c_string_append(c_string_t string, const char* const string_parameter) {
-	return c_string_append_pro(string, string_parameter, string_parameter ? strlen(string_parameter) : 0);
-}
-
-c_string_t c_string_append_slice(c_string_t string, const c_slice_t slice) {
-	if (!slice.data || slice.length == 0)
-	return string;
-	return c_string_append_pro(string, slice.data, slice.length);
-}
-
-c_string_t c_string_append_utf8(c_string_t string, const c_utf8_slice_t slice) {
-	if (!slice.data || slice.length == 0)
-	return string;
-	/* Auto-upgrade: if the destination is ASCII-only, retag it as UTF-8. */
-	if (c_string_get_encoding(string) == C_STRING_ENC_ASCII)
-	c_string_set_encoding(string, C_STRING_ENC_UTF8);
-	return c_string_append_pro(string, slice.data, slice.length);
-}
-
-c_string_t c_string_append_utf16(c_string_t string, const c_utf16_slice_t slice) {
-	if (!slice.data || slice.length == 0)
-	return string;
-	/* Round down to even before delegating. */
-	const size_t byte_len = slice.length & ~(size_t)1u;
-	if (byte_len == 0)
-	return string;
-	return c_string_append_pro(string, slice.data, byte_len);
-}
-
-c_string_t c_string_concat(const c_const_string_t a, const c_const_string_t b) {
-	const unsigned char enc_a = a ? c_string_get_encoding(a) : C_STRING_ENC_ASCII;
-	const size_t la = a ? c_string_get_used_length(a) : 0;
-	const size_t lb = b ? c_string_get_used_length(b) : 0;
-
-	if (la > SIZE_MAX - lb)
-	return NULL; /* overflow guard */
-
-	/* Start with a copy of `a` (or an empty string if a is NULL). */
-	c_string_t result = c_string_create_pro(a, la, enc_a);
-	if (!result)
-	return NULL;
-
-	if (lb > 0) {
-	const size_t before = c_string_get_used_length(result);
-	result = c_string_append_pro(result, b, lb);
-	if (c_string_get_used_length(result) == before) {
-		/* Append failed (OOM); free and propagate the failure. */
-		c_string_free(result);
-		return NULL;
-	}
-	}
-	return result;
-}
-
-/*─────────────────────────────────────────────────────────────────────────────────
-	ENCODING CONVERTERS – UTF-8 NORMALISATION  (via utf8proc)
-─────────────────────────────────────────────────────────────────────────────────*/
-
-c_string_t c_string_create_from_utf8_pro(const char* const text, const utf8proc_option_t options) {
-	if (!text)
-	return NULL;
-
-	utf8proc_uint8_t* destination = NULL;
-
-	/*
-	* utf8proc_map with UTF8PROC_NULLTERM: the `strlen` argument (0 here) is
-	* ignored when NULLTERM is set – utf8proc scans for NUL internally.
-	* We always OR in UTF8PROC_NULLTERM regardless of what the caller passed,
-	* because `text` is required to be NUL-terminated.
-	*/
-	const utf8proc_ssize_t length = utf8proc_map((const utf8proc_uint8_t*)text, 0, &destination, options | UTF8PROC_NULLTERM);
-
-	if (length < 0) {
-	/* utf8proc frees nothing on error; `destination` may be NULL, but
-		* free(NULL) is always safe, so no special-casing is needed. */
-	free(destination);
-	return NULL;
-	}
-
-	c_string_t result = c_string_create_pro(destination, (size_t)length, C_STRING_ENC_UTF8);
-	free(destination);
-	return result;
-}
-
-c_string_t c_string_create_from_utf8(const char* const text) {
-	return c_string_create_from_utf8_pro(text, (utf8proc_option_t)(UTF8PROC_NULLTERM | UTF8PROC_STABLE | UTF8PROC_COMPOSE));
-}
-
-/*─────────────────────────────────────────────────────────────────────────────────
-	ENCODING CONVERTERS – UTF-8 → UTF-16
-─────────────────────────────────────────────────────────────────────────────────*/
-
-c_string_t c_string_convert_utf8_utf16_pro(const c_const_string_t utf8_input, const bool use_big_endian) {
-	if (!utf8_input)
-	return NULL;
-
-	const size_t input_length = c_string_get_used_length(utf8_input);
-
-	/* Start with an empty UTF-16 output string. */
-	c_string_t output = c_string_create_pro(NULL, 0, C_STRING_ENC_UTF16);
-	if (!output)
-	return NULL;
-
-	if (input_length > 0) {
-	/*
-		* Pre-allocate for the worst case: every UTF-8 byte produces one
-		* UTF-16 code unit, i.e. a 2× byte expansion.  (Supplementary plane
-		* characters produce two UTF-16 units from four UTF-8 bytes, so they
-		* are also bounded by 2× at most.)
-		*/
-	if (input_length > SIZE_MAX / 2) {
-		c_string_free(output);
-		return NULL;
-	}
-
-	output = c_string_ensure_capacity(output, input_length * 2u);
-	if (c_string_get_available_capacity(output) < input_length * 2u) {
-		c_string_free(output);
-		return NULL;
-	}
-	}
-
-	const bool swap = needs_swap(use_big_endian);
-	size_t offset = 0;
-
-	while (offset < input_length) {
-	utf8proc_int32_t cp;
-	const size_t rem = input_length - offset;
-	const utf8proc_ssize_t bound = (utf8proc_ssize_t)(rem > (size_t)SSIZE_MAX ? (size_t)SSIZE_MAX : rem);
-	const utf8proc_ssize_t read_bytes = utf8proc_iterate(utf8_input + offset, bound, &cp);
-
-	if (read_bytes <= 0) {
-		/* Invalid UTF-8 sequence (or unexpected 0-advance): abort. */
-		c_string_free(output);
-		return NULL;
-	}
-	offset += (size_t)read_bytes;
-
-	/* Lone surrogates (U+D800–U+DFFF) are not valid Unicode scalar values. */
-	if (cp >= 0xD800 && cp <= 0xDFFF) {
-		c_string_free(output);
-		return NULL;
-	}
-
-	uint16_t units[2];
-	int unit_count = 0;
-
-	if (cp < 0x10000) {
-		units[unit_count++] = (uint16_t)cp;
-	} else {
-		/* Encode as a surrogate pair (cp – 0x10000 split into 10-bit halves). */
-		const int32_t adj = cp - 0x10000;
-		units[unit_count++] = (uint16_t)(0xD800u + (uint32_t)(adj >> 10));
-		units[unit_count++] = (uint16_t)(0xDC00u + (uint32_t)(adj & 0x3FFu));
-	}
-
-	if (swap) {
-		for (int i = 0; i < unit_count; i++)
-		units[i] = bswap16(units[i]);
-	}
-
-	const size_t before = c_string_get_used_length(output);
-	output = c_string_append_pro(output, units, (size_t)unit_count * 2u);
-	if (c_string_get_used_length(output) == before) {
-		c_string_free(output);
-		return NULL;
-	}
-	}
-
-	return c_string_shrink_to_fit(output);
-}
-
-c_string_t c_string_convert_utf8_utf16(const c_const_string_t utf8_input) {
-	return c_string_convert_utf8_utf16_pro(utf8_input, false);
-}
-
-/*─────────────────────────────────────────────────────────────────────────────────
-	ENCODING CONVERTERS – UTF-16 → UTF-8
-─────────────────────────────────────────────────────────────────────────────────*/
-
-c_string_t c_string_convert_utf16_utf8_pro(const c_const_string_t utf16_input, const bool use_big_endian) {
-	if (!utf16_input)
-	return NULL;
-
-	const size_t input_units = c_string_get_used_length(utf16_input) / 2;
-
-	c_string_t output = c_string_create_pro(NULL, 0, C_STRING_ENC_UTF8);
-	if (!output)
-	return NULL;
-
-	const bool swap = needs_swap(use_big_endian);
-
-	for (size_t i = 0; i < input_units;) {
-	uint16_t u1 = c_read_u16(utf16_input + i * 2);
-	i++;
-	if (swap)
-		u1 = bswap16(u1);
-
-	utf8proc_int32_t cp;
-
-	if (u1 >= 0xD800u && u1 <= 0xDBFFu) {
-		/* High surrogate: expect a low surrogate to follow. */
-		if (i < input_units) {
-		uint16_t u2 = c_read_u16(utf16_input + i * 2);
-		if (swap)
-			u2 = bswap16(u2);
-
-		if (u2 >= 0xDC00u && u2 <= 0xDFFFu) {
-			/* Valid surrogate pair: decode to the supplementary codepoint. */
-			cp = (utf8proc_int32_t)(0x10000u + (((uint32_t)(u1 - 0xD800u) << 10) | (uint32_t)(u2 - 0xDC00u)));
-			i++;
-		} else {
-			cp = 0xFFFD; /* lone high surrogate */
-		}
-		} else {
-		cp = 0xFFFD; /* high surrogate at end of stream */
-		}
-	} else if (u1 >= 0xDC00u && u1 <= 0xDFFFu) {
-		cp = 0xFFFD; /* unexpected low surrogate without a preceding high one */
-	} else {
-		cp = (utf8proc_int32_t)u1;
-	}
-
-	uint8_t utf8_buf[4];
-	const utf8proc_ssize_t written = utf8proc_encode_char(cp, utf8_buf);
-	if (written > 0) {
-		const size_t before = c_string_get_used_length(output);
-		output = c_string_append_pro(output, utf8_buf, (size_t)written);
-		if (c_string_get_used_length(output) == before) {
-		c_string_free(output);
-		return NULL;
-		}
-	}
-	}
-
-	return c_string_shrink_to_fit(output);
-}
-
-c_string_t c_string_convert_utf16_utf8(const c_const_string_t utf16_input) {
-	return c_string_convert_utf16_utf8_pro(utf16_input, false);
-}
-
-/*─────────────────────────────────────────────────────────────────────────────────
-	STATIC → DYNAMIC CONVERTER
-─────────────────────────────────────────────────────────────────────────────────*/
-
-c_string_t c_string_to_dynamic(c_string_t string) {
-	if (!string)
-	return NULL;
-	if (!(string[-1] & C_STRING_IS_STATIC))
-	return string; /* already dynamic */
-
-	const size_t len = c_string_get_used_length(string);
-	const unsigned char enc = c_string_get_encoding(string);
-
-	c_string_t dyn = c_string_create_pro(string, len, enc);
-	if (!dyn)
-	return string; /* fallback: return original on allocation failure */
-
-	c_string_free(string);
-	return dyn;
-}
-
-/*─────────────────────────────────────────────────────────────────────────────────
-	UTF-16 STDOUT PRINTING
-─────────────────────────────────────────────────────────────────────────────────*/
-
-void c_string_print_utf16(const c_utf16_slice_t slice) {
-	if (!slice.data || slice.length == 0)
-	return;
-
-	/* Convert the UTF-16 slice to a temporary UTF-8 string, then write it. */
-	c_string_t tmp_utf16 = c_string_from_utf16_slice(slice);
-	if (!tmp_utf16)
-	return;
-
-	c_string_t tmp_utf8 = c_string_convert_utf16_utf8(tmp_utf16);
-	c_string_free(tmp_utf16);
-
-	if (tmp_utf8) {
-	fwrite(tmp_utf8, 1, c_string_get_used_length(tmp_utf8), stdout);
-	c_string_free(tmp_utf8);
-	}
-}
-
-/*─────────────────────────────────────────────────────────────────────────────────
-	CASE CONVERSION  (UTF-8 / ASCII only)
-─────────────────────────────────────────────────────────────────────────────────*/
-
-c_string_t c_string_to_lower(const c_const_string_t string) {
-	if (!string)
-	return NULL;
-
-	const size_t input_len = c_string_get_used_length(string);
-	const unsigned char enc = c_string_get_encoding(string);
-
-	/* Case conversion is only defined for byte-encoded (non-UTF-16) strings. */
-	if (enc == C_STRING_ENC_UTF16)
-	return NULL;
-
-	/*
-	* Guard the cast: utf8proc_map takes a signed length parameter (utf8proc_ssize_t).
-	* If input_len exceeds SSIZE_MAX the cast would produce a negative value, which
-	* utf8proc would misinterpret as a "read until NUL" sentinel.
-	*/
-	if (input_len > (size_t)SSIZE_MAX)
-	return NULL;
-
-	utf8proc_uint8_t* dest = NULL;
-
-	/*
-	* UTF8PROC_CASEFOLD maps each codepoint to its Unicode case-fold form
-	* (locale-independent, full lowercase), then STABLE | COMPOSE normalise
-	* the result to NFC.  We pass the explicit byte count (no NULLTERM needed).
-	*/
-	const utf8proc_ssize_t len = utf8proc_map((const utf8proc_uint8_t*)string, (utf8proc_ssize_t)input_len, &dest, (utf8proc_option_t)(UTF8PROC_STABLE | UTF8PROC_COMPOSE | UTF8PROC_CASEFOLD));
-
-	if (len < 0) {
-	free(dest);
-	return NULL;
-	}
-	c_string_t result = c_string_create_pro(dest, (size_t)len, C_STRING_ENC_UTF8);
-	free(dest);
-	return result;
-}
-
-/* Per-codepoint toupper callback for utf8proc_map_custom. */
-static utf8proc_int32_t _toupper_cb(utf8proc_int32_t cp, void* data) {
-	(void)data;
-	return utf8proc_toupper(cp);
-}
-
-c_string_t c_string_to_upper(const c_const_string_t string) {
-	if (!string)
-	return NULL;
-
-	const size_t input_len = c_string_get_used_length(string);
-	const unsigned char enc = c_string_get_encoding(string);
-
-	if (enc == C_STRING_ENC_UTF16)
-	return NULL;
-
-	/* Same signed-length guard as c_string_to_lower(). */
-	if (input_len > (size_t)SSIZE_MAX)
-	return NULL;
-
-	utf8proc_uint8_t* dest = NULL;
-
-	/*
-	* utf8proc_map_custom applies _toupper_cb to each codepoint before
-	* normalisation.  STABLE | COMPOSE produce NFC output.
-	*/
-	const utf8proc_ssize_t len = utf8proc_map_custom((const utf8proc_uint8_t*)string, (utf8proc_ssize_t)input_len, &dest, (utf8proc_option_t)(UTF8PROC_STABLE | UTF8PROC_COMPOSE), _toupper_cb, NULL);
-
-	if (len < 0) {
-	free(dest);
-	return NULL;
-	}
-	c_string_t result = c_string_create_pro(dest, (size_t)len, C_STRING_ENC_UTF8);
-	free(dest);
-	return result;
-}
-
-/*─────────────────────────────────────────────────────────────────────────────────
-	SEARCHING & COMPARISON
-─────────────────────────────────────────────────────────────────────────────────*/
-
-int c_string_compare(const c_const_string_t a, const c_const_string_t b) {
-	if (a == b)
-	return 0; /* identity fast-path (includes NULL == NULL) */
-	if (!a)
-	return -1; /* NULL sorts before any non-NULL string */
-	if (!b)
-	return 1;
-
-	const size_t la = c_string_get_used_length(a);
-	const size_t lb = c_string_get_used_length(b);
-	const size_t min = la < lb ? la : lb;
-
-	const int cmp = memcmp(a, b, min);
-	if (cmp != 0)
-	return cmp;
-	/* Common prefix is identical: shorter string sorts first. */
-	if (la < lb)
-	return -1;
-	if (la > lb)
-	return 1;
-	return 0;
-}
-
-bool c_string_equal(const c_const_string_t a, const c_const_string_t b) {
-	if (a == b)
-	return true;
-	if (!a || !b)
-	return false;
-	const size_t la = c_string_get_used_length(a);
-	if (la != c_string_get_used_length(b))
-	return false;
-	return memcmp(a, b, la) == 0;
-}
-
-size_t c_string_find(const c_const_string_t haystack, const c_const_string_t needle) {
-	if (!haystack || !needle)
-	return SIZE_MAX;
-
-	const size_t hlen = c_string_get_used_length(haystack);
-	const size_t nlen = c_string_get_used_length(needle);
-
-	if (nlen == 0)
-	return 0; /* empty needle always matches at offset 0 */
-	if (nlen > hlen)
-	return SIZE_MAX; /* needle is longer than haystack */
-
-	/* Naive O(n·m) search; suitable for most real-world string lengths. */
-	const size_t limit = hlen - nlen;
-	for (size_t i = 0; i <= limit; i++) {
-	if (memcmp(haystack + i, needle, nlen) == 0)
-		return i;
-	}
-	return SIZE_MAX;
-}
-
-bool c_string_contains(const c_const_string_t str, const c_const_string_t needle) {
-	return c_string_find(str, needle) != SIZE_MAX;
-}
-
-bool c_string_starts_with(const c_const_string_t str, const c_const_string_t prefix) {
-	if (!str || !prefix)
-	return false;
-	const size_t plen = c_string_get_used_length(prefix);
-	if (plen == 0)
-	return true;
-	const size_t slen = c_string_get_used_length(str);
-	if (plen > slen)
-	return false;
-	return memcmp(str, prefix, plen) == 0;
-}
-
-bool c_string_ends_with(const c_const_string_t str, const c_const_string_t suffix) {
-	if (!str || !suffix)
-	return false;
-	const size_t sflen = c_string_get_used_length(suffix);
-	if (sflen == 0)
-	return true;
-	const size_t slen = c_string_get_used_length(str);
-	if (sflen > slen)
-	return false;
-	return memcmp(str + slen - sflen, suffix, sflen) == 0;
-}
-
-/*─────────────────────────────────────────────────────────────────────────────────
-	IN-PLACE MUTATION  (trim, repeat)
-─────────────────────────────────────────────────────────────────────────────────*/
+/*──────────────────────────────────────────────────────────────────────────────
+  IN-PLACE MUTATION
+──────────────────────────────────────────────────────────────────────────────*/
 
 /*
-	* is_utf16le_whitespace_at  –  True when the UTF-16 LE code unit starting at
-	* `byte_off` in `buf` is one of the four ASCII-range whitespace characters.
-	* Only BMP whitespace (space, tab, LF, CR) is checked here; Unicode-category
-	* space characters like NBSP or ideographic space are left as-is.
-	*/
-static inline bool is_utf16le_whitespace_at(const uint8_t* buf, size_t byte_off) {
-	const uint16_t u = c_read_u16(buf + byte_off);
-	return u == 0x0020u     /* SPACE            */
-				|| u == 0x0009u  /* CHARACTER TABULATION */
-				|| u == 0x000Au  /* LINE FEED        */
-				|| u == 0x000Du; /* CARRIAGE RETURN  */
+ * _is_utf16_whitespace – true if the 2-byte sequence at buffer[byte_offset]
+ * decodes (after optional byte-swap) to a basic ASCII whitespace codepoint.
+ */
+static inline bool _is_utf16_whitespace(const uint8_t *buffer,
+                                         size_t byte_offset,
+                                         bool is_big_endian) {
+    uint16_t unit = _read_u16(buffer + byte_offset);
+    if (is_big_endian) unit = _byte_swap_16(unit);
+    return unit == 0x0020u   /* SPACE           */
+        || unit == 0x0009u   /* HORIZONTAL TAB  */
+        || unit == 0x000Au   /* LINE FEED       */
+        || unit == 0x000Du;  /* CARRIAGE RETURN */
 }
 
-c_string_t c_string_trim_right(c_string_t string) {
-	if (!string)
-	return NULL;
-
-	const unsigned char enc = c_string_get_encoding(string);
-	const size_t null_bytes = null_size_for(enc);
-	size_t len = c_string_get_used_length(string);
-
-	if (enc == C_STRING_ENC_UTF16) {
-	/*
-		* Walk backwards in 2-byte steps.
-		* The condition `len >= 2` guards against wrapping to SIZE_MAX on
-		* an empty string (len == 0).
-		*/
-	while (len >= 2 && is_utf16le_whitespace_at(string, len - 2))
-		len -= 2;
-	} else {
-	while (len > 0) {
-		const uint8_t c = string[len - 1];
-		if (c == ' ' || c == '\t' || c == '\n' || c == '\r')
-		len--;
-		else
-		break;
-	}
-	}
-
-	c_string_set_used_length(string, len);
-	string[len] = '\0';
-	if (null_bytes == 2)
-	string[len + 1] = '\0';
-	return string;
+/*
+ * _is_utf32_whitespace – true if the 4-byte sequence at buffer[byte_offset]
+ * decodes to a basic ASCII whitespace codepoint.
+ */
+static inline bool _is_utf32_whitespace(const uint8_t *buffer,
+                                         size_t byte_offset,
+                                         bool is_big_endian) {
+    uint32_t unit = _read_u32(buffer + byte_offset);
+    if (is_big_endian) unit = _byte_swap_32(unit);
+    return unit == 0x00000020u
+        || unit == 0x00000009u
+        || unit == 0x0000000Au
+        || unit == 0x0000000Du;
 }
 
-c_string_t c_string_trim_left(c_string_t string) {
-	if (!string)
-	return NULL;
+b_str_t b_str_trim_r(b_str_t s) {
+    if (!s) return NULL;
+    const uint8_t encoding       = b_str_enc(s);
+    const size_t  null_term_size = _null_term_size(encoding);
+    size_t        byte_length    = b_str_len(s);
 
-	const unsigned char enc = c_string_get_encoding(string);
-	const size_t null_bytes = null_size_for(enc);
-	const size_t len = c_string_get_used_length(string);
-	size_t start = 0;
-
-	if (enc == C_STRING_ENC_UTF16) {
-	/*
-		* `start + 2 <= len` is equivalent to `start + 1 < len` for even
-		* values of `start`, which is always the case here since we step by 2.
-		* Written as `start + 1 < len` to avoid a potential size_t wrap when
-		* `len == 0` (though that is guarded by the outer check as well).
-		*/
-	while (start + 1 < len && is_utf16le_whitespace_at(string, start))
-		start += 2;
-	} else {
-	while (start < len) {
-		const uint8_t c = string[start];
-		if (c == ' ' || c == '\t' || c == '\n' || c == '\r')
-		start++;
-		else
-		break;
-	}
-	}
-
-	if (start > 0) {
-	const size_t new_len = len - start;
-	memmove(string, string + start, new_len);
-	c_string_set_used_length(string, new_len);
-	string[new_len] = '\0';
-	if (null_bytes == 2)
-		string[new_len + 1] = '\0';
-	}
-	return string;
+    if (B_STR_IS_UTF32_ENC(encoding)) {
+        const bool is_big_endian = (encoding == B_STR_ENC_UTF32BE);
+        /* Each code unit is 4 bytes; the boundary check `byte_length >= 4`
+         * is equivalent to `byte_length - 4 < byte_length` for size_t.      */
+        while (byte_length >= 4u
+               && _is_utf32_whitespace(s, byte_length - 4u, is_big_endian))
+            byte_length -= 4u;
+    } else if (B_STR_IS_UTF16_ENC(encoding)) {
+        const bool is_big_endian = (encoding == B_STR_ENC_UTF16BE);
+        while (byte_length >= 2u
+               && _is_utf16_whitespace(s, byte_length - 2u, is_big_endian))
+            byte_length -= 2u;
+    } else {
+        /* ASCII or UTF-8: compare single bytes. */
+        while (byte_length > 0u) {
+            const uint8_t last_byte = s[byte_length - 1u];
+            if (last_byte == ' ' || last_byte == '\t'
+                    || last_byte == '\n' || last_byte == '\r')
+                byte_length--;
+            else
+                break;
+        }
+    }
+    b_str_set_len(s, byte_length);
+    _write_null_terminator(s, byte_length, null_term_size);
+    return s;
 }
 
-c_string_t c_string_trim(c_string_t string) {
-	return c_string_trim_right(c_string_trim_left(string));
+b_str_t b_str_trim_l(b_str_t s) {
+    if (!s) return NULL;
+    const uint8_t encoding       = b_str_enc(s);
+    const size_t  null_term_size = _null_term_size(encoding);
+    const size_t  byte_length    = b_str_len(s);
+    size_t        trim_start     = 0;
+
+    if (B_STR_IS_UTF32_ENC(encoding)) {
+        const bool is_big_endian = (encoding == B_STR_ENC_UTF32BE);
+        /* Condition: at least 4 bytes remain starting at trim_start. */
+        while (trim_start + 4u <= byte_length
+               && _is_utf32_whitespace(s, trim_start, is_big_endian))
+            trim_start += 4u;
+    } else if (B_STR_IS_UTF16_ENC(encoding)) {
+        const bool is_big_endian = (encoding == B_STR_ENC_UTF16BE);
+        while (trim_start + 2u <= byte_length
+               && _is_utf16_whitespace(s, trim_start, is_big_endian))
+            trim_start += 2u;
+    } else {
+        while (trim_start < byte_length) {
+            const uint8_t first_byte = s[trim_start];
+            if (first_byte == ' ' || first_byte == '\t'
+                    || first_byte == '\n' || first_byte == '\r')
+                trim_start++;
+            else
+                break;
+        }
+    }
+
+    if (trim_start > 0u) {
+        const size_t new_byte_length = byte_length - trim_start;
+        memmove(s, s + trim_start, new_byte_length);
+        b_str_set_len(s, new_byte_length);
+        _write_null_terminator(s, new_byte_length, null_term_size);
+    }
+    return s;
 }
 
-c_string_t c_string_repeat(const c_const_string_t string, const size_t count) {
-	const unsigned char enc = string ? c_string_get_encoding(string) : C_STRING_ENC_ASCII;
+b_str_t b_str_trim(b_str_t s) { return b_str_trim_r(b_str_trim_l(s)); }
 
-	/* Edge cases: NULL input or zero repeat count → return an empty string. */
-	if (!string || count == 0)
-	return c_string_create_pro(NULL, 0, enc);
+b_str_t b_str_repeat(b_cstr_t s, size_t repeat_count) {
+    const uint8_t encoding = s ? b_str_enc(s) : B_STR_ENC_ASCII;
+    if (!s || !repeat_count) return b_str_new_pro(NULL, 0, encoding);
+    const size_t unit_bytes = b_str_len(s);
+    if (!unit_bytes) return b_str_new_pro(NULL, 0, encoding);
+    if (unit_bytes > SIZE_MAX / repeat_count) return NULL;
 
-	const size_t unit_len = c_string_get_used_length(string);
-	if (unit_len == 0)
-	return c_string_create_pro(NULL, 0, enc);
+    const size_t total_bytes = unit_bytes * repeat_count;
+    b_str_t result = b_str_new_pro(NULL, total_bytes, encoding);
+    if (!result) return NULL;
 
-	/* Overflow check: unit_len × count must not exceed SIZE_MAX. */
-	if (unit_len > SIZE_MAX / count)
-	return NULL;
+    for (size_t iteration = 0; iteration < repeat_count; iteration++)
+        memcpy(result + iteration * unit_bytes, s, unit_bytes);
 
-	const size_t total = unit_len * count;
-
-	/*
-	* Allocate a zero-filled buffer of `total` bytes with the correct encoding
-	* and NUL terminator(s), then overwrite with repeated copies of the source.
-	*/
-	c_string_t result = c_string_create_pro(NULL, total, enc);
-	if (!result)
-	return NULL;
-
-	for (size_t i = 0; i < count; i++)
-	memcpy(result + i * unit_len, string, unit_len);
-
-	/* NUL terminator(s) were already written by c_string_create_pro. */
-	return result;
+    /* Length and null terminator were set correctly by b_str_new_pro.
+     * The memcpy loop writes exactly [0, total_bytes); the null terminator
+     * at result[total_bytes] was placed by b_str_new_pro and is untouched. */
+    return result;
 }
 
-/*─────────────────────────────────────────────────────────────────────────────────
-	VALIDATION
-─────────────────────────────────────────────────────────────────────────────────*/
+/*──────────────────────────────────────────────────────────────────────────────
+  VALIDATION
+──────────────────────────────────────────────────────────────────────────────*/
 
-bool c_string_validate_utf8(const c_const_string_t string) {
-	if (!string)
-	return true; /* NULL is vacuously valid */
+bool b_str_valid_utf8(b_cstr_t s) {
+    if (!s) return true;
+    const size_t total_bytes = b_str_len(s);
+    size_t byte_pos = 0;
+    while (byte_pos < total_bytes) {
+        utf8proc_int32_t codepoint;
+        const size_t remaining = total_bytes - byte_pos;
+        const utf8proc_ssize_t advance = utf8proc_iterate(
+            s + byte_pos,
+            (utf8proc_ssize_t)(remaining < (size_t)SSIZE_MAX
+                               ? remaining : (size_t)SSIZE_MAX),
+            &codepoint);
+        if (advance <= 0) return false;
+        byte_pos += (size_t)advance;
+    }
+    return true;
+}
 
-	const size_t total = c_string_get_used_length(string);
-	size_t pos = 0;
+/*──────────────────────────────────────────────────────────────────────────────
+  BOM
+──────────────────────────────────────────────────────────────────────────────*/
 
-	while (pos < total) {
-	utf8proc_int32_t cp;
-	const size_t rem = total - pos;
-	const utf8proc_ssize_t bound = (utf8proc_ssize_t)(rem > (size_t)SSIZE_MAX ? (size_t)SSIZE_MAX : rem);
+uint8_t b_str_detect_bom(const void *data, size_t byte_len,
+                          size_t *bom_size_out) {
+    if (bom_size_out) *bom_size_out = 0;
+    if (!data || byte_len < 2u) return B_STR_ENC_ASCII;
+    const uint8_t *raw = (const uint8_t*)data;
 
-	/*
-		* utf8proc_iterate returns a positive advance count on success and a
-		* negative error code on failure.  A return of <= 0 (which includes
-		* the adv == 0 edge case) is treated as invalid.
-		* Note: checking `adv <= 0` is sufficient; the `cp < 0` test would
-		* be redundant because utf8proc always sets cp = -1 on error.
-		*/
-	const utf8proc_ssize_t adv = utf8proc_iterate((const utf8proc_uint8_t*)(string + pos), bound, &cp);
-	if (adv <= 0)
-		return false;
+    /* UTF-32 BE: 00 00 FE FF  – must be checked before UTF-16 BE */
+    if (byte_len >= 4u
+            && raw[0] == 0x00u && raw[1] == 0x00u
+            && raw[2] == 0xFEu && raw[3] == 0xFFu) {
+        if (bom_size_out) *bom_size_out = 4u;
+        return B_STR_ENC_UTF32BE;
+    }
+    /* UTF-32 LE: FF FE 00 00  – must be checked before UTF-16 LE */
+    if (byte_len >= 4u
+            && raw[0] == 0xFFu && raw[1] == 0xFEu
+            && raw[2] == 0x00u && raw[3] == 0x00u) {
+        if (bom_size_out) *bom_size_out = 4u;
+        return B_STR_ENC_UTF32LE;
+    }
+    /* UTF-8: EF BB BF */
+    if (byte_len >= 3u
+            && raw[0] == 0xEFu && raw[1] == 0xBBu && raw[2] == 0xBFu) {
+        if (bom_size_out) *bom_size_out = 3u;
+        return B_STR_ENC_UTF8;
+    }
+    /* UTF-16 LE: FF FE */
+    if (raw[0] == 0xFFu && raw[1] == 0xFEu) {
+        if (bom_size_out) *bom_size_out = 2u;
+        return B_STR_ENC_UTF16LE;
+    }
+    /* UTF-16 BE: FE FF */
+    if (raw[0] == 0xFEu && raw[1] == 0xFFu) {
+        if (bom_size_out) *bom_size_out = 2u;
+        return B_STR_ENC_UTF16BE;
+    }
 
-	pos += (size_t)adv;
-	}
-	return true;
+    return B_STR_ENC_ASCII;
+}
+
+/* Return the BOM byte array and its size for a given encoding tag. */
+static const uint8_t *_bom_for_encoding(uint8_t encoding,
+                                         size_t *bom_size_out) {
+    switch (encoding & B_STR_ENC_MASK) {
+    case B_STR_ENC_UTF8:    *bom_size_out = 3u; return BOM_UTF8;
+    case B_STR_ENC_UTF16LE: *bom_size_out = 2u; return BOM_UTF16LE;
+    case B_STR_ENC_UTF16BE: *bom_size_out = 2u; return BOM_UTF16BE;
+    case B_STR_ENC_UTF32LE: *bom_size_out = 4u; return BOM_UTF32LE;
+    case B_STR_ENC_UTF32BE: *bom_size_out = 4u; return BOM_UTF32BE;
+    default:                *bom_size_out = 0u; return NULL;
+    }
+}
+
+b_str_t b_str_add_bom(b_str_t s) {
+    if (!s) return NULL;
+
+    size_t         bom_size;
+    const uint8_t *bom_bytes = _bom_for_encoding(b_str_enc(s), &bom_size);
+    if (!bom_bytes || !bom_size) return s;  /* ASCII – no BOM defined */
+
+    const size_t  current_length = b_str_len(s);
+    const uint8_t encoding       = b_str_enc(s);
+    const size_t  null_term_size = _null_term_size(encoding);
+
+    s = b_str_ensure(s, bom_size);
+    if (b_str_avail(s) < bom_size) return s;  /* OOM or static full */
+
+    /* Shift existing content (including null terminator) right by bom_size. */
+    memmove(s + bom_size, s, current_length + null_term_size);
+    memcpy(s, bom_bytes, bom_size);
+    b_str_set_len(s, current_length + bom_size);
+    /* The null terminator bytes were moved by memmove; no rewrite needed. */
+    return s;
+}
+
+/*──────────────────────────────────────────────────────────────────────────────
+  FILE I/O
+──────────────────────────────────────────────────────────────────────────────*/
+
+/*
+ * _read_entire_file – read an entire file into a freshly SDL_malloc'd buffer.
+ * Appends 4 zero bytes at the end (safe null termination for any encoding).
+ * The caller is responsible for calling SDL_free on the returned pointer.
+ * Returns NULL on any error.
+ */
+static uint8_t *_read_entire_file(const char *path, size_t *file_size_out) {
+    FILE *file_handle = fopen(path, "rb");
+    if (!file_handle) return NULL;
+
+    if (fseek(file_handle, 0, SEEK_END) != 0) {
+        fclose(file_handle);
+        return NULL;
+    }
+    const long file_size_signed = ftell(file_handle);
+    if (file_size_signed < 0) { fclose(file_handle); return NULL; }
+    rewind(file_handle);
+
+    const size_t file_size = (size_t)file_size_signed;
+    /* Allocate file_size bytes + 4 trailing zeros for null termination.
+     * The +4 handles the widest null terminator (UTF-32 = 4 zero bytes).   */
+    uint8_t *raw_buffer = (uint8_t*)SDL_malloc(file_size + 4u);
+    if (!raw_buffer) { fclose(file_handle); return NULL; }
+    memset(raw_buffer + file_size, 0, 4u);
+
+    if (fread(raw_buffer, 1u, file_size, file_handle) != file_size) {
+        fclose(file_handle);
+        SDL_free(raw_buffer);
+        return NULL;
+    }
+    fclose(file_handle);
+    *file_size_out = file_size;
+    return raw_buffer;
+}
+
+b_str_t b_str_load_file(const char *path, uint8_t fallback_encoding) {
+    if (!path) return NULL;
+    if (!fallback_encoding) fallback_encoding = B_STR_ENC_UTF8;
+
+    size_t   file_size;
+    uint8_t *raw_data = _read_entire_file(path, &file_size);
+    if (!raw_data) return NULL;
+
+    size_t        bom_size = 0;
+    const uint8_t detected_encoding = b_str_detect_bom(raw_data, file_size,
+                                                         &bom_size);
+    /* Use the detected encoding if a BOM was found; otherwise use fallback. */
+    const uint8_t effective_encoding = bom_size ? detected_encoding
+                                                 : fallback_encoding;
+
+    /* bom_size is always <= file_size (detect_bom guards all lengths). */
+    b_str_t result = b_str_new_pro(raw_data + bom_size, file_size - bom_size,
+                                    effective_encoding);
+    SDL_free(raw_data);
+    return result;
+}
+
+int b_str_save_file(const char *path, b_cstr_t s, bool write_bom) {
+    if (!path || !s) return -1;
+
+    FILE *file_handle = fopen(path, "wb");
+    if (!file_handle) return -1;
+
+    if (write_bom) {
+        size_t         bom_size;
+        const uint8_t *bom_bytes = _bom_for_encoding(b_str_enc(s), &bom_size);
+        if (bom_bytes && bom_size
+                && fwrite(bom_bytes, 1u, bom_size, file_handle) != bom_size) {
+            fclose(file_handle);
+            return -1;
+        }
+    }
+
+    const size_t content_length = b_str_len(s);
+    if (content_length
+            && fwrite(s, 1u, content_length, file_handle) != content_length) {
+        fclose(file_handle);
+        return -1;
+    }
+
+    fclose(file_handle);
+    return 0;
+}
+
+int b_file_add_bom(const char *path, uint8_t encoding) {
+    size_t         bom_size;
+    const uint8_t *bom_bytes = _bom_for_encoding(encoding, &bom_size);
+    if (!bom_bytes || !bom_size) return 0;  /* ASCII – nothing to do */
+
+    size_t   file_size;
+    uint8_t *raw_data = _read_entire_file(path, &file_size);
+    if (!raw_data) return -1;
+
+    /* File already starts with this BOM: leave it untouched. */
+    if (file_size >= bom_size && memcmp(raw_data, bom_bytes, bom_size) == 0) {
+        SDL_free(raw_data);
+        return 0;
+    }
+
+    FILE *file_handle = fopen(path, "wb");
+    if (!file_handle) { SDL_free(raw_data); return -1; }
+
+    int result = 0;
+    if (fwrite(bom_bytes, 1u, bom_size, file_handle) != bom_size)
+        result = -1;
+    if (result == 0 && file_size
+            && fwrite(raw_data, 1u, file_size, file_handle) != file_size)
+        result = -1;
+
+    fclose(file_handle);
+    SDL_free(raw_data);
+    return result;
+}
+
+/*──────────────────────────────────────────────────────────────────────────────
+  INTERNAL GENERIC FILE CONVERTER
+  Not exported; callers use the named wrappers below.
+──────────────────────────────────────────────────────────────────────────────*/
+
+static int _b_file_convert(const char *in_path, const char *out_path,
+                            uint8_t input_fallback_encoding,
+                            uint8_t output_encoding,
+                            bool write_bom) {
+    const uint8_t effective_fallback = input_fallback_encoding
+                                       ? input_fallback_encoding
+                                       : B_STR_ENC_UTF8;
+    b_str_t source = b_str_load_file(in_path, effective_fallback);
+    if (!source) return -1;
+
+    const uint8_t source_encoding = b_str_enc(source);
+    b_str_t destination = NULL;
+
+    if (source_encoding == output_encoding) {
+        /* Same encoding: just copy. */
+        destination = b_str_dup(source);
+    } else if (!B_STR_IS_UTF16_ENC(source_encoding)
+               && !B_STR_IS_UTF32_ENC(source_encoding)
+               && !B_STR_IS_UTF16_ENC(output_encoding)
+               && !B_STR_IS_UTF32_ENC(output_encoding)) {
+        /* Both sides are byte encodings (ASCII / UTF-8): dup and re-tag. */
+        destination = b_str_dup(source);
+        if (destination) b_str_set_enc(destination, output_encoding);
+    } else {
+        /* General path: route through UTF-8 as the common intermediate. */
+        b_str_t utf8_intermediate = NULL;
+        if (B_STR_IS_UTF16_ENC(source_encoding)
+                || B_STR_IS_UTF32_ENC(source_encoding)) {
+            utf8_intermediate = b_str_to_utf8(source);
+        } else {
+            utf8_intermediate = b_str_dup(source);
+            if (utf8_intermediate)
+                b_str_set_enc(utf8_intermediate, B_STR_ENC_UTF8);
+        }
+        if (!utf8_intermediate) { b_str_free(source); return -1; }
+
+        if (!B_STR_IS_UTF16_ENC(output_encoding)
+                && !B_STR_IS_UTF32_ENC(output_encoding)) {
+            /* Output is a byte encoding: use the UTF-8 intermediate directly. */
+            destination = utf8_intermediate;
+            utf8_intermediate = NULL;
+            b_str_set_enc(destination, output_encoding);
+        } else if (output_encoding == B_STR_ENC_UTF16LE) {
+            destination = b_str_to_utf16(utf8_intermediate);
+        } else if (output_encoding == B_STR_ENC_UTF16BE) {
+            destination = b_str_to_utf16be(utf8_intermediate);
+        } else if (output_encoding == B_STR_ENC_UTF32LE) {
+            destination = b_str_to_utf32le(utf8_intermediate);
+        } else if (output_encoding == B_STR_ENC_UTF32BE) {
+            destination = b_str_to_utf32be(utf8_intermediate);
+        }
+        b_str_free(utf8_intermediate);
+    }
+
+    b_str_free(source);
+    if (!destination) return -1;
+
+    b_str_set_enc(destination, output_encoding);
+    const int conversion_result = b_str_save_file(out_path, destination,
+                                                    write_bom);
+    b_str_free(destination);
+    return conversion_result;
+}
+
+/*──────────────────────────────────────────────────────────────────────────────
+  FILE CONVERSION WRAPPERS
+──────────────────────────────────────────────────────────────────────────────*/
+
+/* ── ASCII -> UTF-8 ─────────────────────────────────────────────────────── */
+int b_file_conv_ascii_to_utf8_bom(const char *in_path, const char *out_path) {
+    return _b_file_convert(in_path, out_path, B_STR_ENC_ASCII, B_STR_ENC_UTF8, true);
+}
+int b_file_conv_ascii_to_utf8_no_bom(const char *in_path, const char *out_path) {
+    return _b_file_convert(in_path, out_path, B_STR_ENC_ASCII, B_STR_ENC_UTF8, false);
+}
+
+/* ── UTF-8 -> UTF-16 ────────────────────────────────────────────────────── */
+int b_file_conv_utf8_to_utf16(const char *in_path, const char *out_path) {
+    return _b_file_convert(in_path, out_path, B_STR_ENC_UTF8, _system_utf16_encoding(), true);
+}
+int b_file_conv_utf8_to_utf16le_bom(const char *in_path, const char *out_path) {
+    return _b_file_convert(in_path, out_path, B_STR_ENC_UTF8, B_STR_ENC_UTF16LE, true);
+}
+int b_file_conv_utf8_to_utf16le_no_bom(const char *in_path, const char *out_path) {
+    return _b_file_convert(in_path, out_path, B_STR_ENC_UTF8, B_STR_ENC_UTF16LE, false);
+}
+int b_file_conv_utf8_to_utf16be_bom(const char *in_path, const char *out_path) {
+    return _b_file_convert(in_path, out_path, B_STR_ENC_UTF8, B_STR_ENC_UTF16BE, true);
+}
+int b_file_conv_utf8_to_utf16be_no_bom(const char *in_path, const char *out_path) {
+    return _b_file_convert(in_path, out_path, B_STR_ENC_UTF8, B_STR_ENC_UTF16BE, false);
+}
+
+/* ── UTF-8 -> UTF-32 ────────────────────────────────────────────────────── */
+int b_file_conv_utf8_to_utf32(const char *in_path, const char *out_path) {
+    return _b_file_convert(in_path, out_path, B_STR_ENC_UTF8, _system_utf32_encoding(), true);
+}
+int b_file_conv_utf8_to_utf32le_bom(const char *in_path, const char *out_path) {
+    return _b_file_convert(in_path, out_path, B_STR_ENC_UTF8, B_STR_ENC_UTF32LE, true);
+}
+int b_file_conv_utf8_to_utf32le_no_bom(const char *in_path, const char *out_path) {
+    return _b_file_convert(in_path, out_path, B_STR_ENC_UTF8, B_STR_ENC_UTF32LE, false);
+}
+int b_file_conv_utf8_to_utf32be_bom(const char *in_path, const char *out_path) {
+    return _b_file_convert(in_path, out_path, B_STR_ENC_UTF8, B_STR_ENC_UTF32BE, true);
+}
+int b_file_conv_utf8_to_utf32be_no_bom(const char *in_path, const char *out_path) {
+    return _b_file_convert(in_path, out_path, B_STR_ENC_UTF8, B_STR_ENC_UTF32BE, false);
+}
+
+/* ── UTF-16 -> UTF-8 ────────────────────────────────────────────────────── */
+int b_file_conv_utf16_to_utf8_no_bom(const char *in_path, const char *out_path) {
+    return _b_file_convert(in_path, out_path, B_STR_ENC_UTF16LE, B_STR_ENC_UTF8, false);
+}
+int b_file_conv_utf16le_bom_to_utf8_no_bom(const char *in_path, const char *out_path) {
+    return _b_file_convert(in_path, out_path, B_STR_ENC_UTF16LE, B_STR_ENC_UTF8, false);
+}
+int b_file_conv_utf16le_no_bom_to_utf8_bom(const char *in_path, const char *out_path) {
+    return _b_file_convert(in_path, out_path, B_STR_ENC_UTF16LE, B_STR_ENC_UTF8, true);
+}
+int b_file_conv_utf16le_no_bom_to_utf8_no_bom(const char *in_path, const char *out_path) {
+    return _b_file_convert(in_path, out_path, B_STR_ENC_UTF16LE, B_STR_ENC_UTF8, false);
+}
+int b_file_conv_utf16be_bom_to_utf8_no_bom(const char *in_path, const char *out_path) {
+    return _b_file_convert(in_path, out_path, B_STR_ENC_UTF16BE, B_STR_ENC_UTF8, false);
+}
+int b_file_conv_utf16be_no_bom_to_utf8_bom(const char *in_path, const char *out_path) {
+    return _b_file_convert(in_path, out_path, B_STR_ENC_UTF16BE, B_STR_ENC_UTF8, true);
+}
+int b_file_conv_utf16be_no_bom_to_utf8_no_bom(const char *in_path, const char *out_path) {
+    return _b_file_convert(in_path, out_path, B_STR_ENC_UTF16BE, B_STR_ENC_UTF8, false);
+}
+
+/* ── UTF-32 -> UTF-8 ────────────────────────────────────────────────────── */
+int b_file_conv_utf32_to_utf8_no_bom(const char *in_path, const char *out_path) {
+    return _b_file_convert(in_path, out_path, B_STR_ENC_UTF32LE, B_STR_ENC_UTF8, false);
+}
+int b_file_conv_utf32le_bom_to_utf8_no_bom(const char *in_path, const char *out_path) {
+    return _b_file_convert(in_path, out_path, B_STR_ENC_UTF32LE, B_STR_ENC_UTF8, false);
+}
+int b_file_conv_utf32le_no_bom_to_utf8_bom(const char *in_path, const char *out_path) {
+    return _b_file_convert(in_path, out_path, B_STR_ENC_UTF32LE, B_STR_ENC_UTF8, true);
+}
+int b_file_conv_utf32le_no_bom_to_utf8_no_bom(const char *in_path, const char *out_path) {
+    return _b_file_convert(in_path, out_path, B_STR_ENC_UTF32LE, B_STR_ENC_UTF8, false);
+}
+int b_file_conv_utf32be_bom_to_utf8_no_bom(const char *in_path, const char *out_path) {
+    return _b_file_convert(in_path, out_path, B_STR_ENC_UTF32BE, B_STR_ENC_UTF8, false);
+}
+int b_file_conv_utf32be_no_bom_to_utf8_bom(const char *in_path, const char *out_path) {
+    return _b_file_convert(in_path, out_path, B_STR_ENC_UTF32BE, B_STR_ENC_UTF8, true);
+}
+int b_file_conv_utf32be_no_bom_to_utf8_no_bom(const char *in_path, const char *out_path) {
+    return _b_file_convert(in_path, out_path, B_STR_ENC_UTF32BE, B_STR_ENC_UTF8, false);
+}
+
+/*──────────────────────────────────────────────────────────────────────────────
+  UTF-16 STDOUT HELPER
+──────────────────────────────────────────────────────────────────────────────*/
+
+void b_str_print_utf16(b_u16slice_t slice) {
+    if (!slice.data || !slice.len) return;
+    b_str_t temp_utf16 = b_str_from_u16slice(slice);
+    if (!temp_utf16) return;
+    b_str_t temp_utf8 = b_str_to_utf8(temp_utf16);
+    b_str_free(temp_utf16);
+    if (temp_utf8) {
+        fwrite(temp_utf8, 1u, b_str_len(temp_utf8), stdout);
+        b_str_free(temp_utf8);
+    }
 }
